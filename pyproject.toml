@@ -1,0 +1,17 @@
+[project]
+name = "seele"
+version = "0.1.0"
+description = "Prompt Claude Code on your own machine from Discord: DMs or server threads, usage, effort, models, sessions."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = ["discord.py>=2.5"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+seele = "seele.__main__:cli"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,46 @@
+# seele settings. Copy to ~/.config/seele/config.toml and `chmod 600` it (it holds the bot token).
+
+# Bot token from https://discord.com/developers/applications → your app → Bot → Reset Token.
+# DISCORD_TOKEN in the environment wins over this.
+token = ""
+
+# Discord user IDs allowed to use the bot. Empty = the application's owner (or team members).
+owners = []
+
+# Servers whose slash commands should update instantly (global ones can take a few minutes).
+guilds = []
+
+# Command for /cost (prints a table; gets `-d DAYS`). Empty = `cost` on PATH, if any.
+cost_command = ""
+
+# Largest file /get uploads, in MB (Discord's limit for bots is 10 unless the server is boosted).
+max_upload_mb = 10
+
+[claude]
+binary = "claude"
+default_cwd = "~"            # where new conversations start
+projects_root = "~/Projects" # what /cd suggests
+model = ""                   # empty = Claude Code's default
+effort = ""                  # empty = Claude Code's saved default (/effort)
+permission_mode = "auto"     # auto | acceptEdits | plan | bypassPermissions
+settings_file = "~/.claude/settings.json"  # where `/effort ... everywhere:True` saves the default
+# system_prompt = "..."      # appended to Claude Code's own; the default explains it's on Discord
+
+# Extra environment for Claude Code runs (for example to silence your own hooks).
+[claude.env]
+# NOTIFY_DONE = "0"
+
+# Claude accounts. The first one is the default; `paths` pick an account by working folder.
+# Leave this out to use whatever `claude` uses.
+[accounts.claude]
+config_dir = "~/.claude"
+
+# [accounts.claude2]
+# config_dir = "~/.claude-2"
+# paths = ["~/Projects/some-project"]
+# effort = "xhigh"           # default effort for this account (a conversation's /effort wins)
+
+# While this process runs, Claude is told to keep it light (e.g. a game on the same machine).
+[guard]
+process = ""
+note = "A game is running on this machine right now: avoid heavy local work (builds, test suites, big downloads) unless asked."

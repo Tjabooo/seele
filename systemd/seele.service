@@ -1,0 +1,14 @@
+[Unit]
+Description=seele: prompt Claude Code from Discord
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/share/seele/venv/bin/python -m seele run
+Restart=always
+RestartSec=10
+# The bot itself is tiny; Claude Code runs as its child.
+Nice=5
+
+[Install]
+WantedBy=default.target
