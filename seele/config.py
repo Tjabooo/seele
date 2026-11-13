@@ -11,11 +11,26 @@ CONFIG_PATH = Path(os.environ.get("SEELE_CONFIG", "~/.config/seele/config.toml")
 STATE_PATH = Path(os.environ.get("SEELE_STATE", "~/.local/state/seele/state.json")).expanduser()
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are running headless: the owner is talking to you through a Discord bot and reads your "
+    "You are running headless: people are talking to you through a Discord bot and read your "
     "final reply on Discord, often on a phone. Keep the final reply short and use Discord markdown "
     "(no wide tables, no HTML). You cannot ask interactive questions; if you need a decision, ask "
-    "it at the end of your reply and the owner will answer in the next message."
+    "it at the end of your reply and they will answer in the next message."
 )
+
+SPEAKER_NOTE = (
+    "Each Discord message starts with a line like `[Discord message from NAME]` saying who sent it. "
+    "More than one person may use this bot, even in the same conversation: reply to the person who "
+    "sent the latest message, and don't assume they are the machine's owner unless the name says so."
+)
+
+
+def speaker_line(name: str) -> str:
+    return f"[Discord message from {name}]"
+
+
+def tag_prompt(name: str, prompt: str) -> str:
+    """Prefix a prompt with who sent it, so Claude can tell users apart."""
+    return f"{speaker_line(name)}\n{prompt}"
 
 
 @dataclass
@@ -30,6 +45,7 @@ class Account:
 class Config:
     token: str = ""
     owners: set[int] = field(default_factory=set)
+    people: dict[int, str] = field(default_factory=dict)  # Discord user id -> name Claude sees
     guilds: list[int] = field(default_factory=list)
     claude_bin: str = "claude"
     projects_root: Path = Path("~/Projects").expanduser()
@@ -45,6 +61,9 @@ class Config:
     cost_command: str = ""
     settings_file: Path = Path("~/.claude/settings.json").expanduser()
     max_upload_mb: int = 10
+
+    def name_for(self, uid: int, fallback: str) -> str:
+        return self.people.get(uid) or fallback
 
     def account_for(self, cwd: Path, override: str | None = None) -> Account:
         if override:
@@ -68,6 +87,7 @@ def load(path: Path = CONFIG_PATH) -> Config:
     cfg = Config()
     cfg.token = os.environ.get("DISCORD_TOKEN") or raw.get("token", "")
     cfg.owners = {int(x) for x in raw.get("owners", [])}
+    cfg.people = {int(k): str(v) for k, v in raw.get("people", {}).items()}
     cfg.guilds = [int(x) for x in raw.get("guilds", [])]
     c = raw.get("claude", {})
     cfg.claude_bin = c.get("binary", cfg.claude_bin)

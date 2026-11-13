@@ -16,6 +16,11 @@ cost_command = ""
 # Largest file /get uploads, in MB (Discord's limit for bots is 10 unless the server is boosted).
 max_upload_mb = 10
 
+# Names Claude sees for each user (every prompt starts with "[Discord message from NAME]").
+# Missing users fall back to their Discord display name.
+[people]
+# 123456789012345678 = "Alice"
+
 [claude]
 binary = "claude"
 default_cwd = "~"            # where new conversations start

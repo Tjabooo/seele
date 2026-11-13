@@ -15,7 +15,8 @@ import discord
 from discord import app_commands
 
 from . import claude, usage
-from .config import Config, Conversation, State, default_effort, set_default_effort
+from .config import (SPEAKER_NOTE, Config, Conversation, State, default_effort, set_default_effort,
+                     tag_prompt)
 from .text import code_safe, duration, short_path, split_message, thread_name
 
 log = logging.getLogger("seele")
@@ -182,6 +183,8 @@ class Seele(discord.Client):
         prompt = await self.with_attachments(msg, content)
         if not prompt.strip():
             return
+        name = self.cfg.name_for(msg.author.id, msg.author.display_name)
+        prompt = tag_prompt(name, prompt)
         if key in self.jobs:
             self.queue.setdefault(key, []).append(prompt)
             await msg.add_reaction("📥")
@@ -246,7 +249,9 @@ class Seele(discord.Client):
             self.jobs.pop(key, None)
             await channel.send(f"⚠️ Working folder `{cwd}` doesn't exist. Use `/cd`.")
             return
-        system = self.cfg.system_prompt
+        system = self.cfg.system_prompt + "\n\n" + SPEAKER_NOTE
+        if self.cfg.people:
+            system += " Known people: " + ", ".join(sorted(set(self.cfg.people.values()))) + "."
         guard = await self.guard_active()
         if guard and self.cfg.guard_note:
             system += "\n\n" + self.cfg.guard_note

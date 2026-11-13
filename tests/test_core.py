@@ -127,6 +127,8 @@ def test_config_accounts_and_paths(tmp_path, monkeypatch):
     cfg_file.write_text(f'''
 token = "t"
 owners = [1, 2]
+[people]
+1 = "Ann"
 [claude]
 effort = "high"
 [accounts.main]
@@ -144,6 +146,8 @@ effort = "xhigh"
     (proj / "sub").mkdir()
     assert cfg.account_for(proj / "sub").name == "alt"
     assert cfg.account_for(proj, "main").name == "main"
+    assert cfg.name_for(1, "ann_discord") == "Ann" and cfg.name_for(2, "Bob") == "Bob"
+    assert config.tag_prompt("Ann", "hi") == "[Discord message from Ann]\nhi"
 
 
 def test_state_roundtrip_and_inherit(tmp_path):

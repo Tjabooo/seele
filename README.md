@@ -38,6 +38,8 @@ seele ▸ ✅ Done · 1:07 · 9 tools · 5 h 13% · `3f2a91c0`
   `/get path` uploads a file back.
 - **Guard process.** While a given process runs (say, a game), Claude is told to keep it light.
 - **Owner only.** Everyone else is ignored; the owner defaults to the Discord application's owner.
+- **Knows who's talking.** With several owners, every prompt starts with `[Discord message from NAME]`
+  (names from `[people]` in the config, else the Discord display name), so Claude can tell them apart.
 
 ## Install
 
