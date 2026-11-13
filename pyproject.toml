@@ -9,7 +9,7 @@ description = "Prompt Claude Code on your own machine from Discord: DMs or serve
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
-dependencies = ["discord.py>=2.5"]
+dependencies = ["discord.py>=2.7.1"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
