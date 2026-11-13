@@ -8,6 +8,7 @@ unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
 python3 -m venv "$data/venv"
 "$data/venv/bin/pip" install -q --upgrade "$here"
+"$data/venv/bin/pip" install -q --force-reinstall --no-deps "$here"  # same version number still updates
 
 mkdir -p "$conf" "$unit"
 if [ ! -f "$conf/config.toml" ]; then
