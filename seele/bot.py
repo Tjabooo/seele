@@ -20,7 +20,7 @@ from .text import code_safe, duration, short_path, split_message, thread_name
 
 log = logging.getLogger("seele")
 HOME = str(Path.home())
-MODEL_HINTS = ["default", "opus", "sonnet", "haiku", "fable", "opus[1m]", "sonnet[1m]"]
+MODEL_HINTS = ["default", "claude-opus-5-5", "opus", "sonnet", "haiku", "fable"]
 
 
 @dataclass
@@ -436,7 +436,7 @@ def register_commands(bot: Seele):
         await interaction.response.send_message(f"⚙️ Effort here: **{shown}**.")
 
     @command("model", "Set the model for this conversation")
-    @app_commands.describe(name="opus, sonnet, haiku, fable, a full model id, or default")
+    @app_commands.describe(name="claude-opus-5-5, opus, sonnet, haiku, fable, a full model id, or default")
     async def model(interaction: discord.Interaction, name: str):
         if not await guard(interaction):
             return

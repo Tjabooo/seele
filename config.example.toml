@@ -20,7 +20,7 @@ max_upload_mb = 10
 binary = "claude"
 default_cwd = "~"            # where new conversations start
 projects_root = "~/Projects" # what /cd suggests
-model = ""                   # empty = Claude Code's default
+model = ""                   # empty = Claude Code's default; a full id (claude-opus-5-5) pins it (aliases like opus may pick a [1m] variant)
 effort = ""                  # empty = Claude Code's saved default (/effort)
 permission_mode = "auto"     # auto | acceptEdits | plan | bypassPermissions
 settings_file = "~/.claude/settings.json"  # where `/effort ... everywhere:True` saves the default
