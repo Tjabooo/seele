@@ -120,17 +120,30 @@ class Seele(discord.Client):
             elif info.owner:
                 self.owners = {info.owner.id}
         log.info("connected as %s; owners %s", self.user, sorted(self.owners))
-        greeted = self.state.get(0)  # key 0 holds bot-wide flags
-        if not greeted.last_prompt:
-            for uid in self.owners:
-                try:
-                    user = await self.fetch_user(uid)
-                    await user.send("**SEELE online.** Message me here to prompt Claude Code on this machine. "
-                                    "`/usage`, `/effort`, `/cd`, `/new`, `/status` and friends work here too.")
-                except discord.HTTPException as e:
-                    log.warning("could not DM owner %s: %s", uid, e)
-            greeted.last_prompt = "greeted"
-            self.state.save()
+        await self.greet()
+
+    async def greet(self):
+        """DM each owner once, so the DM channel exists. Retried until it works (needs a mutual
+        server or the app added to the owner's account)."""
+        flags = self.state.get(0)  # key 0 holds bot-wide flags; last_prompt lists greeted owners
+        done = set(flags.last_prompt.split()) if flags.last_prompt else set()
+        for uid in self.owners - {int(x) for x in done if x.isdigit()}:
+            try:
+                user = await self.fetch_user(uid)
+                await user.send("**SEELE online.** Message me here to prompt Claude Code on this machine. "
+                                "`/usage`, `/effort`, `/cd`, `/new`, `/status` and friends work here too.")
+                done.add(str(uid))
+            except discord.HTTPException as e:
+                log.warning("could not DM owner %s yet: %s", uid, e)
+        flags.last_prompt = " ".join(sorted(done))
+        self.state.save()
+
+    async def on_interaction(self, interaction: discord.Interaction):
+        if self.is_owner_id(interaction.user.id):
+            await self.greet()
+
+    async def on_guild_join(self, _guild: discord.Guild):
+        await self.greet()
 
     def is_owner_id(self, uid: int) -> bool:
         return uid in self.owners
