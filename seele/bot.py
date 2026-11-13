@@ -201,6 +201,7 @@ class Seele(discord.Client):
         return (prompt or "See the attached files.") + "\n\nAttached files (saved on this machine):\n" + "\n".join(lines)
 
     def submit(self, key: int, channel, prompt: str):
+        self.jobs[key] = Job(channel, prompt)  # placeholder: marks the chat busy right away
         task = asyncio.create_task(self.run_job(key, channel, prompt))
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
@@ -242,6 +243,7 @@ class Seele(discord.Client):
         conv.last_prompt = prompt
         cwd, account, model, effort, mode = self.settings_for(conv)
         if not cwd.is_dir():
+            self.jobs.pop(key, None)
             await channel.send(f"⚠️ Working folder `{cwd}` doesn't exist. Use `/cd`.")
             return
         system = self.cfg.system_prompt
@@ -288,7 +290,6 @@ class Seele(discord.Client):
                 self.state.save()
                 await job.status.edit(content=self.render(job, "↻ **Old session not found, starting fresh**"),
                                       view=None)
-                self.jobs.pop(key, None)
                 return await self.run_job(key, channel, prompt, retried=True)
             await self.finish(key, job, result, account.name)
         except Exception as e:  # never leave a conversation stuck
