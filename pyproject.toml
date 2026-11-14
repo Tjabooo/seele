@@ -12,7 +12,7 @@ requires-python = ">=3.11"
 dependencies = ["discord.py>=2.5"]
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+test = ["pytest>=9.2.0"]
 
 [project.scripts]
 seele = "seele.__main__:cli"
