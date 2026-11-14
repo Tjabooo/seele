@@ -30,6 +30,7 @@ effort = ""                  # empty = Claude Code's saved default (/effort)
 permission_mode = "auto"     # auto | acceptEdits | plan | bypassPermissions
 settings_file = "~/.claude/settings.json"  # where `/effort ... everywhere:True` saves the default
 # system_prompt = "..."      # appended to Claude Code's own; the default explains it's on Discord
+live_input = true            # messages sent while Claude works go straight into the running session
 
 # Extra environment for Claude Code runs (for example to silence your own hooks).
 [claude.env]
@@ -49,3 +50,10 @@ config_dir = "~/.claude"
 [guard]
 process = ""
 note = "A game is running on this machine right now: avoid heavy local work (builds, test suites, big downloads) unless asked."
+
+# Names for channels, used by the CLI: `seele post --channel progress`, `seele conv --id lead`,
+# `--agents-channel agents`. Values are channel or thread ids.
+[channels]
+# lead = 123456789012345678
+# progress = 123456789012345678
+# agents = 123456789012345678

@@ -9,6 +9,8 @@ from pathlib import Path
 
 CONFIG_PATH = Path(os.environ.get("SEELE_CONFIG", "~/.config/seele/config.toml")).expanduser()
 STATE_PATH = Path(os.environ.get("SEELE_STATE", "~/.local/state/seele/state.json")).expanduser()
+REQUESTS_DIR = Path(os.environ.get("SEELE_REQUESTS", STATE_PATH.parent / "requests")).expanduser()
+MAX_AGENT_CARDS = 400  # agent cards remembered in the state file (oldest dropped)
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are running headless: people are talking to you through a Discord bot and read your "
@@ -61,9 +63,21 @@ class Config:
     cost_command: str = ""
     settings_file: Path = Path("~/.claude/settings.json").expanduser()
     max_upload_mb: int = 10
+    channels: dict[str, int] = field(default_factory=dict)  # names for `seele post --channel NAME`
+    live_input: bool = True  # messages sent while Claude works go straight into the running turn
 
     def name_for(self, uid: int, fallback: str) -> str:
         return self.people.get(uid) or fallback
+
+    def channel_id(self, value: str | int) -> int:
+        """A channel id from an id, a `<#id>` mention or a name in `[channels]`."""
+        text = str(value).strip().removeprefix("<#").removesuffix(">").lstrip("#")
+        if text.isdigit():
+            return int(text)
+        if text in self.channels:
+            return self.channels[text]
+        known = ", ".join(sorted(self.channels)) or "none configured"
+        raise ValueError(f"unknown channel {value!r} (names in [channels]: {known})")
 
     def account_for(self, cwd: Path, override: str | None = None) -> Account:
         if override:
@@ -76,6 +90,16 @@ class Config:
                 if cwd == p or p in cwd.parents:
                     return acc
         return self.accounts[0]
+
+
+def account_env(cfg: "Config", account: Account) -> dict[str, str]:
+    """Environment for Claude Code runs on `account`."""
+    env = {**os.environ, **cfg.env}
+    if account.config_dir.resolve() == (Path.home() / ".claude").resolve():
+        env.pop("CLAUDE_CONFIG_DIR", None)  # default dir keeps ~/.claude.json
+    else:
+        env["CLAUDE_CONFIG_DIR"] = str(account.config_dir)
+    return env
 
 
 def _path(value: str) -> Path:
@@ -101,6 +125,8 @@ def load(path: Path = CONFIG_PATH) -> Config:
     cfg.settings_file = _path(c.get("settings_file", str(cfg.settings_file)))
     cfg.cost_command = raw.get("cost_command", "")
     cfg.max_upload_mb = int(raw.get("max_upload_mb", cfg.max_upload_mb))
+    cfg.channels = {str(k): int(v) for k, v in raw.get("channels", {}).items()}
+    cfg.live_input = bool(c.get("live_input", cfg.live_input))
     for name, acc in raw.get("accounts", {}).items():
         cfg.accounts.append(Account(name, _path(acc.get("config_dir", "~/.claude")),
                                     [_path(p).resolve() for p in acc.get("paths", [])],
@@ -125,24 +151,30 @@ class Conversation:
     mode: str = ""
     listen: bool = False  # server channels: answer every message, not only mentions
     last_prompt: str = ""
+    agents_channel: str = ""  # channel id for subagent cards; empty = list them in the status
+    autoresume: bool = False  # after a usage limit, prompt again when it resets
+    resume_at: float = 0.0  # epoch seconds of a scheduled auto-resume (0 = none)
 
     def inherit(self) -> "Conversation":
         """Settings a new thread takes from its channel (no session)."""
         return Conversation(cwd=self.cwd, account=self.account, model=self.model,
-                            effort=self.effort, mode=self.mode)
+                            effort=self.effort, mode=self.mode, agents_channel=self.agents_channel,
+                            autoresume=self.autoresume)
 
 
 class State:
     def __init__(self, path: Path = STATE_PATH):
         self.path = path
         self.convs: dict[str, Conversation] = {}
+        self.agents: dict[str, dict] = {}  # task id -> agent card (see agents.Card)
         if path.exists():
             try:
                 raw = json.loads(path.read_text())
                 fields = Conversation.__dataclass_fields__
                 for key, val in raw.get("conversations", {}).items():
                     self.convs[key] = Conversation(**{k: v for k, v in val.items() if k in fields})
-            except (OSError, json.JSONDecodeError, TypeError):
+                self.agents = {str(k): v for k, v in (raw.get("agents") or {}).items() if isinstance(v, dict)}
+            except (OSError, json.JSONDecodeError, TypeError, AttributeError):
                 pass
 
     def get(self, channel_id: int) -> Conversation:
@@ -153,9 +185,12 @@ class State:
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if len(self.agents) > MAX_AGENT_CARDS:
+            keep = sorted(self.agents.items(), key=lambda kv: kv[1].get("started", 0))[-MAX_AGENT_CARDS:]
+            self.agents = dict(keep)
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"conversations": {k: asdict(v) for k, v in self.convs.items()}},
-                                  indent=1))
+        tmp.write_text(json.dumps({"conversations": {k: asdict(v) for k, v in self.convs.items()},
+                                   "agents": self.agents}, indent=1))
         tmp.replace(self.path)
 
 

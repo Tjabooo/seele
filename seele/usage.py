@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+from .claude import reset_from_text
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 LABELS = {
@@ -89,6 +92,79 @@ def format_rows(data: dict) -> str:
     return "\n".join(lines) or "No limits reported."
 
 
+def _window(utilization: float, resets_at: str | None) -> dict:
+    epoch = None
+    if resets_at:
+        try:
+            epoch = int(datetime.fromisoformat(resets_at.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            pass
+    return {"utilization": round(utilization, 4), "resets_at": resets_at or None, "resets_epoch": epoch}
+
+
+def windows(data: dict) -> dict:
+    """The five-hour and weekly (all models) windows from the usage API, utilization as 0..1."""
+    out = {}
+    for key in ("five_hour", "seven_day"):
+        win = data.get(key)
+        if isinstance(win, dict) and win.get("utilization") is not None:
+            out[key] = _window(float(win["utilization"]) / 100, win.get("resets_at"))
+    for lim in data.get("limits") or []:
+        key = {"session": "five_hour", "weekly_all": "seven_day"}.get(lim.get("kind")) if isinstance(lim, dict) else None
+        if key and key not in out and lim.get("percent") is not None:
+            out[key] = _window(float(lim["percent"]) / 100, lim.get("resets_at"))
+    return out
+
+
+TEXT_LINE = re.compile(r"Current (session|week \(all models\)):\s*(\d+(?:\.\d+)?)%\s*used(.*)", re.I)
+
+
+def windows_from_text(text: str, now: float | None = None) -> dict:
+    """The same windows from `claude -p /usage` output ("Current session: 6% used · resets ...")."""
+    out = {}
+    for line in text.splitlines():
+        m = TEXT_LINE.search(line)
+        if not m:
+            continue
+        key = "five_hour" if m.group(1).lower() == "session" else "seven_day"
+        reset = reset_from_text(m.group(3), now)
+        iso = datetime.fromtimestamp(reset, timezone.utc).isoformat() if reset else None
+        out[key] = _window(float(m.group(2)) / 100, iso)
+    return out
+
+
+async def cli_usage(binary: str, config_dir: Path, env: dict[str, str]) -> str:
+    """`claude -p /usage` output; it also refreshes an expired login."""
+    proc = await asyncio.create_subprocess_exec(
+        binary, "-p", "/usage", env={**env, "CLAUDE_CONFIG_DIR": str(config_dir)},
+        stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), 90)
+    except TimeoutError:
+        proc.kill()
+        raise
+    return out.decode(errors="replace")
+
+
+async def account_windows(binary: str, config_dir: Path, env: dict[str, str]) -> dict:
+    """{"five_hour": {...}, "seven_day": {...}, "source": "api" | "cli"} for one account, or
+    {"error": "..."} when neither the API nor the CLI gave numbers."""
+    token = read_token(config_dir)
+    if token:
+        try:
+            found = windows(await asyncio.to_thread(fetch, token))
+            if found:
+                return {**found, "source": "api"}
+        except Exception:
+            pass
+    try:
+        text = await cli_usage(binary, config_dir, env)
+    except (TimeoutError, OSError) as e:
+        return {"error": f"claude -p /usage failed: {e or 'timed out'}"}
+    found = windows_from_text(text)
+    return {**found, "source": "cli"} if found else {"error": text.strip()[:300] or "no usage reported"}
+
+
 async def for_account(binary: str, config_dir: Path, env: dict[str, str]) -> str:
     """Usage text for one account. Falls back to `claude -p /usage`, which refreshes the login."""
     token = read_token(config_dir)
@@ -98,14 +174,9 @@ async def for_account(binary: str, config_dir: Path, env: dict[str, str]) -> str
             return format_rows(data)
         except Exception:
             pass
-    proc = await asyncio.create_subprocess_exec(
-        binary, "-p", "/usage", env={**env, "CLAUDE_CONFIG_DIR": str(config_dir)},
-        stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(), 90)
+        text = await cli_usage(binary, config_dir, env)
     except TimeoutError:
-        proc.kill()
         return "Timed out asking Claude Code for usage."
-    text = out.decode(errors="replace")
     keep = [ln for ln in text.splitlines() if "% used" in ln or "resets" in ln]
     return "\n".join(keep) or text.strip()[:900]
