@@ -10,7 +10,9 @@ python3 -m venv "$data/venv"
 "$data/venv/bin/pip" install -q --upgrade "$here"
 "$data/venv/bin/pip" install -q --force-reinstall --no-deps "$here"  # same version number still updates
 
-mkdir -p "$conf" "$unit"
+mkdir -p "$conf" "$unit" "$HOME/.local/bin"
+link="$HOME/.local/bin/seele"  # the CLI (seele post / conv / prompt / usage) on PATH
+if [ ! -e "$link" ] || [ -L "$link" ]; then ln -sfn "$data/venv/bin/seele" "$link"; fi
 if [ ! -f "$conf/config.toml" ]; then
   install -m 600 "$here/config.example.toml" "$conf/config.toml"
   echo "Created $conf/config.toml: put your bot token in it."

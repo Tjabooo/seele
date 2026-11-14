@@ -35,11 +35,151 @@ def test_parse_init_tool_text_result():
     assert (ev.kind, ev.text, ev.is_error, ev.turns, ev.cost) == ("result", "done", False, 3, 0.5)
 
 
-def test_parse_skips_subagent_noise_and_garbage():
-    assert claude.parse_line(line(type="assistant", parent_tool_use_id="t1",
-                                  message={"content": [{"type": "text", "text": "inner"}]})) == []
+def test_parse_marks_subagent_steps_and_skips_garbage():
+    [ev] = claude.parse_line(line(type="assistant", parent_tool_use_id="t1",
+                                  message={"content": [{"type": "text", "text": "inner"}]}))
+    assert (ev.kind, ev.text, ev.agent) == ("text", "inner", "t1")
     assert claude.parse_line("not json") == []
     assert claude.parse_line(line(type="user", message={})) == []
+
+
+def test_parse_task_events():
+    [ev] = claude.parse_line(line(type="system", subtype="task_started", task_id="a1", task_type="local_agent"))
+    assert ev.kind == "task_started" and ev.data["task_id"] == "a1"
+    [ev] = claude.parse_line(line(type="system", subtype="background_tasks_changed", tasks=[{"task_id": "a1"}]))
+    assert ev.kind == "tasks" and ev.data["tasks"] == [{"task_id": "a1"}]
+    assert claude.parse_line(line(type="system", subtype="hook_started")) == []
+
+
+def test_limit_reset_from_rate_event():
+    allowed = {"status": "allowed", "overageStatus": "rejected", "resetsAt": 100,
+               "unifiedWindows": {"five_hour": {"status": "allowed", "resetsAt": 100}}}
+    assert claude.limit_reset(allowed) is None  # overage "rejected" is not a limit
+    five = {"status": "rejected", "resetsAt": 100, "unifiedWindows": {
+        "five_hour": {"status": "rejected", "resetsAt": 100}, "seven_day": {"status": "allowed", "resetsAt": 900}}}
+    assert claude.limit_reset(five) == 100
+    both = {"status": "rejected", "unifiedWindows": {
+        "five_hour": {"status": "rejected", "resetsAt": 100}, "seven_day": {"status": "rejected", "resetsAt": 900}}}
+    assert claude.limit_reset(both) == 900
+    assert claude.limit_reset({"status": "rejected", "resetsAt": 300}) == 300
+
+
+def test_reset_from_text():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("Europe/Berlin")
+    now = datetime(2026, 11, 14, 15, 0, tzinfo=tz).timestamp()
+    at = claude.reset_from_text("You've hit your limit · resets 7pm (Europe/Berlin)", now)
+    assert datetime.fromtimestamp(at, tz) == datetime(2026, 11, 14, 19, 0, tzinfo=tz)
+    at = claude.reset_from_text("5-hour limit reached ∙ resets 9:30am (Europe/Berlin)", now)
+    assert datetime.fromtimestamp(at, tz) == datetime(2026, 11, 15, 9, 30, tzinfo=tz)  # tomorrow
+    at = claude.reset_from_text("Weekly limit reached · resets Nov 20, 7pm (Europe/Berlin)", now)
+    assert datetime.fromtimestamp(at, tz) == datetime(2026, 11, 20, 19, 0, tzinfo=tz)
+    assert claude.reset_from_text("Claude AI usage limit reached|1794690600") == 1794690600
+    assert claude.reset_from_text("All good") is None
+
+
+def test_build_argv_live_and_user_line():
+    argv = claude.build_argv("claude", live=True)
+    assert argv[argv.index("--input-format") + 1] == "stream-json"
+    assert json.loads(claude.user_line("hi")) == {"type": "user", "message": {"role": "user", "content": "hi"}}
+
+
+def test_run_closes_stdin_only_when_idle():
+    import asyncio
+
+    class Stdin:
+        closed = False
+
+        def is_closing(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+        def write(self, data):
+            pass
+
+        async def drain(self):
+            pass
+
+    class Proc:
+        returncode = None
+        stdin = Stdin()
+
+    def ev(kind, **data):
+        return claude.Event(kind, data=data)
+
+    async def go():
+        run = claude.Run([], "p", Path("."), {}, live=True, idle_grace=0.05)
+        run.proc, run.input_open = Proc(), True
+        run._track(ev("init"))
+        run._track(ev("tasks", tasks=[{"task_id": "a"}]))
+        run._track(ev("result"))
+        assert run.input_open  # an agent still runs: keep listening
+        assert await run.send("more") and run.written
+        run._track(ev("init"))
+        run._track(ev("result"))
+        assert run.input_open and not run.written
+        run._track(ev("tasks", tasks=[]))  # agent done while idle: it'll usually wake Claude up...
+        run._track(ev("init"))  # ...and it did
+        await asyncio.sleep(0.1)
+        assert run.input_open
+        run._track(ev("result"))
+        assert not run.input_open and Proc.stdin.closed
+        assert not await run.send("too late")
+
+        quiet = claude.Run([], "p", Path("."), {}, live=True, idle_grace=0.05)
+        Proc.stdin = Stdin()
+        quiet.proc, quiet.input_open = Proc(), True
+        quiet._track(ev("tasks", tasks=[{"task_id": "a"}]))
+        quiet._track(ev("result"))
+        quiet._track(ev("tasks", tasks=[]))  # nothing wakes up: close after the grace period
+        assert quiet.input_open
+        await asyncio.sleep(0.1)
+        assert not quiet.input_open
+    asyncio.run(go())
+
+
+def test_agent_card_rendering():
+    from seele import agents
+    card = agents.Card("t1", description="Build the reef", subagent_type="general-purpose", started=1000,
+                       tools=3, tokens=12345, activity="Running tests", jump="https://x/y")
+    embed = agents.card_embed(card, 1100)
+    assert embed.title == "🤖 Build the reef" and embed.color.value == agents.STATUS["running"][2]
+    assert "Running" in embed.description and "<t:1000:R>" in embed.description and "12.3k" in embed.description
+    assert "Running tests" in embed.description and "(https://x/y)" in embed.description
+    card.status, card.ended, card.runs = "done", 1130, 2
+    embed = agents.card_embed(card, 2000)
+    assert "Done" in embed.description and "Took 2:10" in embed.description and "run 2" in embed.description
+    card.status, card.runs = "running", 3
+    assert "Running again" in agents.card_embed(card, 2000).description
+    assert agents.compact_line(card, 1060).startswith("🤖 Build the reef · general-purpose · ")
+    assert [agents.card_status(s) for s in ("completed", "failed", "killed")] == ["done", "failed", "stopped"]
+    assert agents.is_agent("local_agent") and agents.is_agent("remote_agent") and not agents.is_agent("local_bash")
+
+
+def test_config_channels_and_new_fields(tmp_path):
+    cfg_file = tmp_path / "c.toml"
+    cfg_file.write_text("[channels]\nprogress = 123\n[claude]\nlive_input = false\n")
+    cfg = config.load(cfg_file)
+    assert cfg.channel_id("progress") == 123 and cfg.channel_id("#progress") == 123
+    assert cfg.channel_id("456") == 456 and cfg.channel_id("<#789>") == 789
+    assert not cfg.live_input
+    try:
+        cfg.channel_id("nope")
+        raise AssertionError("should fail")
+    except ValueError as e:
+        assert "progress" in str(e)
+    st = config.State(tmp_path / "s.json")
+    conv = st.get(1)
+    conv.agents_channel, conv.autoresume, conv.resume_at = "55", True, 123.0
+    st.agents["t1"] = {"task_id": "t1", "status": "done", "started": 1}
+    st.save()
+    again = config.State(tmp_path / "s.json")
+    assert again.get(1).resume_at == 123.0 and again.agents["t1"]["status"] == "done"
+    child = again.get(1).inherit()
+    assert child.agents_channel == "55" and child.autoresume and child.resume_at == 0
 
 
 def test_parse_error_result_and_rate():
@@ -49,6 +189,8 @@ def test_parse_error_result_and_rate():
     [ev] = claude.parse_line(line(type="rate_limit_event", rate_limit_info={
         "unifiedWindows": {"five_hour": {"utilization": 0.42}}}))
     assert ev.kind == "rate" and ev.utilization == 0.42
+    [ev] = claude.parse_line(line(type="rate_limit_event", rate_limit_info={"status": "rejected"}))
+    assert ev.kind == "rate" and ev.utilization is None and ev.data["status"] == "rejected"
 
 
 def test_tool_summary_shortens_home():

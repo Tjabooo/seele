@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "seele"
-version = "0.1.0"
+version = "0.2.0"
 description = "Prompt Claude Code on your own machine from Discord: DMs or server threads, usage, effort, models, sessions."
 readme = "README.md"
 license = "MIT"
