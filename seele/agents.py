@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import time
 from dataclasses import asdict, dataclass, field
 
 import discord
 
+from .claude import looks_like_limit
 from .text import duration, split_message
 
 log = logging.getLogger("seele.agents")
@@ -40,6 +42,14 @@ def card_status(status: str | None) -> str:
     if s in ("failed", "error", "errored"):
         return "failed"
     return "stopped"  # killed, stopped, cancelled, ...
+
+
+def limit_stop(d: dict) -> str:
+    """The error text of a task_notification for an agent that a usage limit stopped, else ""."""
+    if card_status(d.get("status")) not in ("failed", "stopped"):
+        return ""
+    text = " ".join(str(d.get(k) or "") for k in ("summary", "error", "note")).strip()
+    return text if looks_like_limit(text) else ""
 
 
 def tokens(n: int) -> str:
@@ -227,8 +237,9 @@ class Board:
 class Tracker:
     """The agents of one running job. Feed it the run's task and subagent events."""
 
-    def __init__(self, board: Board, key: int, conv, jump: str = ""):
+    def __init__(self, board: Board, key: int, conv, jump: str = "", on_limit=None):
         self.board, self.key, self.conv, self.jump = board, key, conv, jump
+        self.on_limit = on_limit  # async (card, error text): an agent was stopped by a usage limit
         self.cards: dict[str, Card] = {}
         self.by_tool: dict[str, str] = {}  # Agent tool_use id -> task id
 
@@ -363,7 +374,14 @@ class Tracker:
 
     async def _notification(self, d: dict):
         card = self._card(d)
+        limit = limit_stop(d)
         if card is None:
+            # an agent whose start this run never saw ("Agent terminated early due to an API error: ..."
+            # or 'Agent "NAME" failed: ...'): still worth resuming
+            if limit and d.get("task_id") and re.search(r"\bAgent\b", limit):
+                named = re.search(r'Agent "([^"]+)"', limit)
+                await self._limited(Card(d["task_id"], conv=self.key, status="failed",
+                                         description=named.group(1) if named else ""), limit)
             return
         now = time.time()
         card.status = card_status(d.get("status"))
@@ -388,6 +406,16 @@ class Tracker:
                     await self.board.send_text(card, live.last_text, "last-message.md")
             self.board.keep(card)
         live.report = live.last_text = ""
+        if limit:
+            await self._limited(card, limit)
+
+    async def _limited(self, card: Card, text: str):
+        if self.on_limit is None:
+            return
+        try:
+            await self.on_limit(card, text)
+        except Exception:
+            log.exception("could not schedule a resume for agent %s", card.task_id)
 
     async def flush(self, force: bool = False):
         for card in list(self.cards.values()):

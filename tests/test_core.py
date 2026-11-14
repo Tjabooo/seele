@@ -2,7 +2,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from seele import claude, config, usage
+from seele import agents, claude, config, usage
 from seele.__main__ import app_id_from_token, invite_links
 from seele.text import duration, split_message
 
@@ -199,10 +199,41 @@ def test_tool_summary_shortens_home():
     assert claude.tool_summary("TodoWrite", {"todos": []}) == "TodoWrite"
 
 
+AGENT_LIMIT = ('Agent "SB1: Stubby look-dev r01" failed: Agent terminated early due to an API error: You\'ve hit '
+               "your 5-hour limit · resets 10:10pm (Europe/Stockholm) (error type rate_limit, HTTP 429, request id "
+               "req_x, model sent to the API: claude-opus-5-5)")
+
+
 def test_looks_like_limit():
     assert claude.looks_like_limit("You've hit your limit · resets 7pm")
     assert claude.looks_like_limit("Claude usage limit reached.")
+    assert claude.looks_like_limit(AGENT_LIMIT)
+    assert claude.looks_like_limit("You've hit your weekly limit · resets Nov 14, 5pm (Europe/Stockholm)")
+    assert claude.looks_like_limit("API error (error type rate_limit, HTTP 429)")
     assert not claude.looks_like_limit("All tests passed.")
+    assert not claude.looks_like_limit("API error: Overloaded (error type overloaded_error, HTTP 529)")
+
+
+def test_reset_from_agent_limit_text():
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("Europe/Stockholm")
+    now = datetime(2026, 11, 14, 21, 30, tzinfo=tz).timestamp()
+    at = claude.reset_from_text(AGENT_LIMIT, now)
+    assert datetime.fromtimestamp(at, tz) == datetime(2026, 11, 14, 22, 10, tzinfo=tz)
+    later = datetime(2026, 11, 14, 22, 30, tzinfo=tz).timestamp()  # already past today: tomorrow
+    assert datetime.fromtimestamp(claude.reset_from_text(AGENT_LIMIT, later), tz) == \
+        datetime(2026, 11, 15, 22, 10, tzinfo=tz)
+    at = claude.reset_from_text("The limit resets at 10:10pm (Europe/Stockholm). Once its requests", now)
+    assert datetime.fromtimestamp(at, tz) == datetime(2026, 11, 14, 22, 10, tzinfo=tz)
+    weekly = "You've hit your weekly limit · resets Nov 18, 5pm (Europe/Stockholm) (error type rate_limit, HTTP 429)"
+    assert datetime.fromtimestamp(claude.reset_from_text(weekly, now), tz) == datetime(2026, 11, 18, 17, 0, tzinfo=tz)
+
+
+def test_limit_stop_only_for_failed_agents():
+    assert agents.limit_stop({"status": "failed", "summary": AGENT_LIMIT}) == AGENT_LIMIT
+    assert agents.limit_stop({"status": "killed", "summary": "", "error": "You've hit your limit"})
+    assert agents.limit_stop({"status": "failed", "summary": 'Agent "x" failed: Overloaded'}) == ""
+    assert agents.limit_stop({"status": "completed", "summary": "Report: we hit your usage limit twice"}) == ""
 
 
 def test_split_message_keeps_fences_balanced():
@@ -336,3 +367,28 @@ def test_invite_links():
     server, user = invite_links("123")
     assert "client_id=123" in server and "scope=bot+applications.commands" in server
     assert "integration_type=1" in user
+
+
+def test_tracker_reports_limit_stopped_agents(tmp_path):
+    import asyncio
+    seen = []
+
+    async def on_limit(card, text):
+        seen.append((card.task_id, card.description))
+    board = agents.Board(config.State(tmp_path / "s.json"), resolve=None)
+    tracker = agents.Tracker(board, 1, config.Conversation(), on_limit=on_limit)
+
+    async def go():
+        await tracker.handle(claude.Event("task_started", data={"task_id": "a1", "task_type": "local_agent",
+                                                                 "description": "one"}))
+        await tracker.handle(claude.Event("task_notification", data={"task_id": "a1", "status": "failed",
+                                                                      "summary": AGENT_LIMIT}))
+        # an agent this run never saw start, in the stream's own wording
+        await tracker.handle(claude.Event("task_notification", data={
+            "task_id": "a2", "status": "failed",
+            "summary": "Agent terminated early due to an API error: You've hit your weekly limit"}))
+        await tracker.handle(claude.Event("task_notification", data={
+            "task_id": "b1", "status": "failed", "summary": "Background command failed: hit your limit"}))
+    asyncio.run(go())
+    assert seen == [("a1", "one"), ("a2", "")]
+    assert tracker.cards["a1"].status == "failed"

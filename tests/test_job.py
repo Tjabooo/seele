@@ -8,6 +8,7 @@ import time
 
 import pytest
 
+from seele import agents, claude
 from seele import bot as botmod
 from seele import config
 from seele.__main__ import write_request
@@ -80,17 +81,56 @@ def agent_scenario(prompt):
     out(type="system", subtype="init", session_id=sid, model="fake", cwd=".")
     out(type="result", subtype="success", is_error=False, result="", session_id=sid)
 
+# the summary of a task_notification as stream-json sends it for an agent stopped by the limit
+LIMIT_NOTE = ("Agent terminated early due to an API error: You've hit your 5-hour limit · resets 10:10pm "
+              "(Europe/Stockholm) (error type rate_limit, HTTP 429, request id req_x, model sent to the API: "
+              "claude-opus-5-5)")
+OTHER_NOTE = "Agent terminated early due to an API error: Overloaded (error type overloaded_error, HTTP 529)"
+
+def agent_limit_scenario(prompt):
+    # agent ae46... is stopped by the 5-hour limit; the lead's own turn ends normally. With STAY a
+    # second agent keeps the process alive (stdin open), waiting for the next message.
+    agents = [("tu2", "ae4690131b5af3ed0", "SB1: Stubby look-dev r01")]
+    if "STAY" in prompt:
+        agents.append(("tu3", "a0000000000000003", "slow one"))
+    for tu, tid, desc in agents:
+        out(type="assistant", message={"content": [{"type": "tool_use", "id": tu, "name": "Agent",
+            "input": {"description": desc, "prompt": "work", "run_in_background": True}}]})
+        out(type="system", subtype="task_started", task_id=tid, tool_use_id=tu, description=desc,
+            subagent_type="general-purpose", task_type="local_agent", prompt="work")
+    out(type="system", subtype="background_tasks_changed",
+        tasks=[{"task_id": tid, "task_type": "local_agent"} for _, tid, _ in agents])
+    out(type="system", subtype="task_updated", task_id="ae4690131b5af3ed0", patch={"status": "failed"})
+    out(type="system", subtype="task_notification", task_id="ae4690131b5af3ed0", status="failed",
+        summary=OTHER_NOTE if "OTHERFAIL" in prompt else LIMIT_NOTE)
+    out(type="system", subtype="background_tasks_changed",
+        tasks=[{"task_id": tid, "task_type": "local_agent"} for _, tid, _ in agents[1:]])
+    out(type="result", subtype="success", is_error=False, result="STARTED", session_id=sid)
+    if "STAY" not in prompt:
+        return
+    m = nxt(timeout=8)
+    if m:
+        note(m)
+        out(type="system", subtype="init", session_id=sid, model="fake", cwd=".")
+        out(type="result", subtype="success", is_error=False, result="got: " + m.splitlines()[-1], session_id=sid)
+    out(type="system", subtype="task_notification", task_id="a0000000000000003", status="completed", summary="ok")
+    out(type="system", subtype="background_tasks_changed", tasks=[])
+    out(type="system", subtype="init", session_id=sid, model="fake", cwd=".")
+    out(type="result", subtype="success", is_error=False, result="", session_id=sid)
+
 def turn(prompt):
     note(prompt)
     out(type="system", subtype="init", session_id=sid, model="fake", cwd=".")
     out(type="assistant", message={"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]})
     out(type="rate_limit_event", rate_limit_info={"status": "allowed", "overageStatus": "rejected",
         "unifiedWindows": {"five_hour": {"utilization": 0.25, "status": "allowed"}}})
-    if "LIMIT" in prompt:
+    if "LIMIT" in prompt and "AGENTLIMIT" not in prompt:
         out(type="rate_limit_event", rate_limit_info={"status": "rejected", "resetsAt": 2000000000,
             "unifiedWindows": {"five_hour": {"utilization": 1.0, "resetsAt": 1999990000, "status": "rejected"},
                                "seven_day": {"utilization": 1.0, "resetsAt": 2000000000, "status": "rejected"}}})
         out(type="result", subtype="success", is_error=True, result="You've hit your limit", session_id=sid)
+    elif "AGENTLIMIT" in prompt:
+        agent_limit_scenario(prompt)
     elif "AGENT" in prompt:
         agent_scenario(prompt)
     else:
@@ -433,3 +473,128 @@ def test_stop_kills_a_live_run(bot):
     asyncio.run(go())
     final = [m for m in ch.live() if m.content.startswith(("⏹", "✅", "⚠️"))]
     assert final and final[-1].content.startswith("⏹ **Stopped**")
+
+
+STOPPED = "ae4690131b5af3ed0"  # the agent id the lead's SendMessage takes (= its task id)
+STOPPED_LINE = f"- `{STOPPED}`: SB1: Stubby look-dev r01 (general-purpose)"
+
+
+def test_agent_limit_schedules_resume_and_names_the_agent_after_the_run_exits(bot):
+    b, fake = bot
+    ch, agents_ch = Channel(1), Channel(500)
+    b.get_channel = lambda cid: {1: ch, 500: agents_ch, **agents_ch.threads}.get(cid)
+    conv = b.state.get(1)
+    conv.autoresume, conv.agents_channel = True, "500"
+
+    async def go():
+        b.submit(1, ch, "AGENTLIMIT go")
+        await until(lambda: not b.jobs)  # the lead's turn ended normally and the process exited
+        expected = claude.reset_from_text("resets 10:10pm (Europe/Stockholm)") + botmod.RESUME_DELAY
+        assert abs(conv.resume_at - expected) < 5 and not conv.resume_guessed
+        assert conv.resume_agents == [{"id": STOPPED, "description": "SB1: Stubby look-dev r01",
+                                       "type": "general-purpose"}]
+        assert b.state.agents[STOPPED]["status"] == "failed"
+        b.state = config.State(b.state.path)  # survives a restart: it's in the state file
+        b.board.state = b.state
+        conv2 = b.state.get(1)
+        assert conv2.resume_agents[0]["id"] == STOPPED
+        conv2.resume_at = time.time() - 1  # the reset has passed
+        await b.check_resumes()
+        await until(lambda: not b.jobs)
+        assert conv2.resume_at == 0 and conv2.resume_agents == []  # sent once, then cleared
+    asyncio.run(go())
+    announced = [m.content for m in ch.sent if m.content.startswith("⏸")]
+    assert len(announced) == 1 and announced[0].startswith(
+        "⏸ Background agents hit the usage limit; resuming automatically at <t:")
+    assert any(m.content == "▶️ The usage limit has reset: resuming and picking up 1 stopped agent."
+               for m in ch.sent)
+    first, resumed = calls(fake)
+    assert resumed["prompt"].startswith(botmod.AUTORESUME_PROMPT)
+    assert resumed["prompt"].endswith(STOPPED_LINE)
+    assert resumed["argv"][resumed["argv"].index("--resume") + 1] == "sess-1"
+
+
+def test_agent_limit_resume_goes_into_the_running_session(bot):
+    b, fake = bot
+    ch = Channel(1)
+    b.get_channel = lambda cid: ch if cid == 1 else None
+    conv = b.state.get(1)
+    conv.autoresume = True  # no agents channel: the cards only live in memory
+
+    async def go():
+        b.submit(1, ch, "AGENTLIMIT STAY")
+        await until(lambda: any(m.content == "STARTED" for m in ch.sent))
+        assert conv.resume_at and [a["id"] for a in conv.resume_agents] == [STOPPED]
+        conv.resume_at = time.time() - 1
+        await b.check_resumes()
+        await until(lambda: not b.jobs)
+    asyncio.run(go())
+    prompts = [c["prompt"] for c in calls(fake)]
+    assert len(prompts) == 2 and prompts[1].startswith(botmod.AUTORESUME_PROMPT)
+    replies = [m.content for m in ch.live() if m.content.startswith(("got:", "answer:"))]
+    assert replies == ["got: " + STOPPED_LINE]  # answered by the same process, not a second run
+    assert any(m.content.startswith("▶️") and "sent into the running session" in m.content for m in ch.sent)
+
+
+def test_agent_failure_without_a_limit_or_autoresume_schedules_nothing(bot):
+    b, _ = bot
+    ch = Channel(1)
+    b.state.get(1).autoresume = True
+    b.state.get(2).autoresume = False
+
+    async def go():
+        b.submit(1, ch, "AGENTLIMIT OTHERFAIL")  # failed, but not because of a limit
+        await until(lambda: not b.jobs)
+        b.submit(2, ch, "AGENTLIMIT go")  # a limit, but auto-resume is off
+        await until(lambda: not b.jobs)
+    asyncio.run(go())
+    for key in (1, 2):
+        assert b.state.get(key).resume_at == 0 and b.state.get(key).resume_agents == []
+    assert not any((m.content or "").startswith("⏸") for m in ch.sent)
+
+
+def test_resume_dedupes_later_reset_wins_and_stop_drops_it(bot):
+    b, _ = bot
+    ch = Channel(3)
+    conv = b.state.get(3)
+    conv.autoresume = True
+    job = botmod.Job(ch, "x", key=3)
+    acc = b.cfg.accounts[0]
+    text = "Agent terminated early due to an API error: You've hit your 5-hour limit · resets 10:10pm (Europe/Stockholm)"
+
+    async def go():
+        for tid in ("a1", "a2", "a1"):  # two agents at the same limit, one of them reported twice
+            await b.agent_limited(3, job, agents.Card(tid, description=f"job {tid}"), text, acc)
+        first = conv.resume_at
+        assert abs(first - claude.reset_from_text(text) - botmod.RESUME_DELAY) < 5
+        # the lead's own limit at the same reset: already scheduled and announced
+        await b.schedule_resume(3, job, claude.Event("result", text=text, is_error=True), acc)
+        assert not await b.plan_resume(3, ch, None, "Usage limit hit")  # a guess never replaces a known time
+        assert not await b.plan_resume(3, ch, first - 7200, "Usage limit hit")  # an earlier reset neither
+        assert conv.resume_at == first
+        assert await b.plan_resume(3, ch, first + 86400, "Usage limit hit")  # a later (weekly) reset wins
+        assert conv.resume_at == first + 86400 + botmod.RESUME_DELAY
+    asyncio.run(go())
+    assert [a["id"] for a in conv.resume_agents] == ["a1", "a2"]
+    prompt = botmod.resume_prompt(conv.resume_agents)
+    assert prompt.startswith(botmod.AUTORESUME_PROMPT) and "- `a1`: job a1" in prompt and "- `a2`: job a2" in prompt
+    assert len([m for m in ch.sent if m.content.startswith("⏸")]) == 2  # scheduled, then moved later
+    assert not b.stop(3)  # nothing running, but /stop still drops the scheduled resume and its list
+    assert conv.resume_at == 0 and conv.resume_agents == []
+
+
+def test_human_prompt_cancelling_a_resume_carries_the_stopped_agents(bot):
+    b, fake = bot
+    ch = Channel(8)
+    conv = b.state.get(8)
+    conv.autoresume, conv.resume_at = True, time.time() + 3600
+    conv.resume_agents = [{"id": "a9", "description": "nine", "type": ""}]
+
+    async def go():
+        b.submit(8, ch, "carry on")
+        await until(lambda: not b.jobs)
+    asyncio.run(go())
+    [call] = calls(fake)
+    assert call["prompt"].startswith("carry on\n\n[SEELE note] Agents the limit stopped") and "- `a9`: nine" in call["prompt"]
+    assert conv.resume_at == 0 and conv.resume_agents == []
+    assert any("Auto-resume cancelled" in m.content and "1 stopped agent" in m.content for m in ch.sent)

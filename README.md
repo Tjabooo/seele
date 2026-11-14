@@ -37,7 +37,11 @@ seele ▸ ✅ Done · 1:07 · 9 tools · 5 h 13% · `3f2a91c0`
   back) with a thread holding its prompt, its steps and its final report. Without one, running
   agents are listed in the live status.
 - **Auto-resume.** With `/autoresume on`, a run stopped by a usage limit (5-hour or weekly) is
-  picked up again 5 minutes after the limit resets. The schedule survives restarts.
+  picked up again 5 minutes after the limit resets. Background agents count too: when one fails
+  on the limit (even while the run itself goes on, or after it has exited), the resume is scheduled
+  and its prompt names every stopped agent by id, so Claude can continue each one with
+  `SendMessage`. If the run is still going at the reset, the prompt goes into it as live input.
+  The schedule survives restarts.
 - **Scriptable.** `seele post`, `seele thread`, `seele history`, `seele conv`, `seele prompt` and `seele usage` let
   Claude itself (or any script) post screenshots, open threads, change settings, hand over to a
   fresh session and pace itself against plan limits.

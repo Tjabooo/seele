@@ -154,6 +154,10 @@ class Conversation:
     agents_channel: str = ""  # channel id for subagent cards; empty = list them in the status
     autoresume: bool = False  # after a usage limit, prompt again when it resets
     resume_at: float = 0.0  # epoch seconds of a scheduled auto-resume (0 = none)
+    resume_guessed: bool = False  # resume_at is a guess (the reset time was unknown)
+    # background agents a usage limit stopped, named in the next auto-resume prompt:
+    # [{"id": agent/task id (what SendMessage takes), "description": ..., "type": subagent type}]
+    resume_agents: list = field(default_factory=list)
 
     def inherit(self) -> "Conversation":
         """Settings a new thread takes from its channel (no session)."""

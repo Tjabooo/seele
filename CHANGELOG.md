@@ -4,6 +4,15 @@ All notable changes to this project are listed here ([Keep a Changelog](https://
 
 ## [Unreleased]
 
+- **Auto-resume after background agents hit a limit**: an agent whose task-notification failed on a
+  usage limit ("You've hit your 5-hour limit · resets 10:10pm (Europe/Stockholm)", weekly wording too)
+  now schedules the conversation's auto-resume (reset from the message, else the run's rate-limit event,
+  else the usage API; + 5 minutes), announced once. It works while the run goes on, after its turn ended,
+  and after it exited. The resume prompt lists the stopped agents with their ids (what `SendMessage`
+  takes); the list is persisted and cleared once sent. A resume that comes due while the run is still
+  going is written into it as live input instead of waiting for it to end. Several limits at once: the
+  later reset wins and a guessed time never replaces a known one. `/status` shows the stopped agents.
+- Limit detection also matches "hit your 5-hour/weekly limit" and the `rate_limit` error type.
 - `seele history --channel NAME_OR_ID | --server GUILD_ID [--limit N] [--bots] [--json]`: print a
   channel's messages, or every text channel and thread in a server, oldest first (bots left out by default).
 

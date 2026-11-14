@@ -180,8 +180,9 @@ def reset_from_text(text: str, now: float | None = None) -> float | None:
     return when.timestamp()
 
 
-LIMIT_RE = re.compile(r"(usage|rate|session|weekly)[ -]limit|hit your limit|limit reached|out of (extra )?usage",
-                      re.I)
+# "You've hit your limit", "You've hit your 5-hour limit", "...weekly limit", "error type rate_limit", ...
+LIMIT_RE = re.compile(r"(usage|rate|session|weekly)[ _-]limit|hit your (?:[\w-]+ ){0,3}limit|limit reached"
+                      r"|out of (extra )?usage", re.I)
 
 
 def looks_like_limit(text: str) -> bool:
