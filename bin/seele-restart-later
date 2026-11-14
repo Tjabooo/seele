@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Restart the seele user service once no Claude Code process runs inside it.
+# A plain restart kills every running prompt (and all of its background agents), so this waits:
+# it looks at the service's cgroup every SEELE_RESTART_EVERY seconds (default 60) and restarts the
+# service as soon as no `claude` process is left in it, then exits.
+#
+#   seele-restart-later           wait in the background (transient user unit seele-restart-later)
+#   seele-restart-later --status  is a restart pending?
+#   seele-restart-later --cancel  drop the pending restart
+#   seele-restart-later --wait    run the wait loop in the foreground (what the unit runs)
+set -euo pipefail
+service="${SEELE_SERVICE:-seele.service}"
+every="${SEELE_RESTART_EVERY:-60}"
+job="seele-restart-later"
+
+claude_running() {  # true while any process in the service's cgroup (or below) is Claude Code
+  local cg dir pid comm arg0
+  cg="$(systemctl --user show -p ControlGroup --value "$service" 2>/dev/null || true)"
+  [ -n "$cg" ] || return 1
+  dir="/sys/fs/cgroup$cg"
+  [ -d "$dir" ] || return 1
+  while read -r pid; do
+    [ -n "$pid" ] || continue
+    comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
+    arg0="$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | head -n 1 || true)"
+    if [ "$comm" = claude ] || [ "${arg0##*/}" = claude ]; then
+      return 0
+    fi
+  done < <(find "$dir" -name cgroup.procs -exec cat {} + 2>/dev/null || true)
+  return 1
+}
+
+wait_and_restart() {
+  echo "waiting until $service runs no claude process (checking every ${every}s)"
+  while :; do
+    if ! claude_running; then
+      sleep 5  # a prompt may be just starting: look once more
+      if ! claude_running; then
+        echo "no claude process in $service: restarting it"
+        systemctl --user restart "$service"
+        exit 0
+      fi
+    fi
+    sleep "$every"
+  done
+}
+
+case "${1:-}" in
+  --wait)
+    wait_and_restart
+    ;;
+  --status)
+    if systemctl --user is-active -q "$job.service"; then
+      echo "restart pending ($job.service, since $(systemctl --user show -p ActiveEnterTimestamp --value "$job.service"))"
+      if claude_running; then echo "claude is still running in $service"; fi
+    else
+      echo "no restart pending"
+    fi
+    ;;
+  --cancel)
+    if systemctl --user is-active -q "$job.service"; then
+      systemctl --user stop "$job.service"
+      echo "pending restart cancelled"
+    else
+      echo "no restart pending"
+    fi
+    ;;
+  "")
+    if systemctl --user is-active -q "$job.service"; then
+      echo "a restart is already pending ($job.service)"
+      exit 0
+    fi
+    systemctl --user reset-failed "$job.service" >/dev/null 2>&1 || true
+    self="$(readlink -f -- "$0")"
+    systemd-run --user --quiet --collect --unit "$job" \
+      --description "Restart $service once no Claude prompt runs in it" \
+      --setenv=SEELE_SERVICE="$service" --setenv=SEELE_RESTART_EVERY="$every" \
+      /usr/bin/env bash "$self" --wait
+    if claude_running; then
+      echo "restart pending: $service restarts once its claude processes are gone (journalctl --user -u $job)"
+    else
+      echo "nothing running in $service: it restarts within a few seconds"
+    fi
+    ;;
+  -h|--help)
+    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+  *)
+    echo "usage: seele-restart-later [--status|--cancel|--wait]" >&2
+    exit 2
+    ;;
+esac

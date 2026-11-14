@@ -13,6 +13,8 @@ All notable changes to this project are listed here ([Keep a Changelog](https://
   going is written into it as live input instead of waiting for it to end. Several limits at once: the
   later reset wins and a guessed time never replaces a known one. `/status` shows the stopped agents.
 - Limit detection also matches "hit your 5-hour/weekly limit" and the `rate_limit` error type.
+- `install.sh --no-restart` installs without restarting the service; `bin/seele-restart-later`
+  restarts it once no `claude` process runs inside it (a transient user unit).
 - `seele history --channel NAME_OR_ID | --server GUILD_ID [--limit N] [--bots] [--json]`: print a
   channel's messages, or every text channel and thread in a server, oldest first (bots left out by default).
 
