@@ -122,3 +122,55 @@ def create_thread(token: str, channel_id: int, name: str, *, opener=urllib.reque
         raise RestError("the thread needs a name")
     return request(token, "POST", f"/channels/{channel_id}/threads",
                    {"name": name, "type": 11, "auto_archive_duration": 10080}, opener=opener)
+
+
+TEXT_CHANNELS = (0, 5)  # text, announcement
+THREADS = (10, 11, 12)  # announcement thread, public thread, private thread
+
+
+def messages(token: str, channel_id: int, limit: int | None = None, *,
+             opener=urllib.request.urlopen) -> list[dict]:
+    """A channel's (or thread's) messages, newest first, up to `limit` (None = all)."""
+    out: list[dict] = []
+    before = None
+    while limit is None or len(out) < limit:
+        n = 100 if limit is None else min(100, limit - len(out))
+        page = request(token, "GET", f"/channels/{channel_id}/messages?limit={n}"
+                       + (f"&before={before}" if before else ""), opener=opener)
+        if not isinstance(page, list) or not page:
+            break
+        out.extend(page)
+        if len(page) < n:
+            break
+        before = page[-1]["id"]
+    return out
+
+
+def guild_channels(token: str, guild_id: int, *, opener=urllib.request.urlopen) -> list[dict]:
+    """A server's text channels plus its threads (active, and archived public ones) the bot can see."""
+    chans = [c for c in request(token, "GET", f"/guilds/{guild_id}/channels", opener=opener)
+             if c.get("type") in TEXT_CHANNELS]
+    threads = request(token, "GET", f"/guilds/{guild_id}/threads/active", opener=opener).get("threads", [])
+    for c in chans:
+        try:
+            threads += request(token, "GET", f"/channels/{c['id']}/threads/archived/public?limit=100",
+                               opener=opener).get("threads", [])
+        except RestError:
+            pass  # no access to that channel's archive
+    seen, out = set(), []
+    for c in chans + threads:
+        if c["id"] not in seen:
+            seen.add(c["id"])
+            out.append(c)
+    return out
+
+
+def format_message(msg: dict, name_for=lambda uid, fallback: fallback) -> str:
+    """One line: `2026-11-14 18:03 Name: text [file.png]` (newlines kept as ` / `)."""
+    author = msg.get("author") or {}
+    name = name_for(int(author.get("id") or 0), author.get("global_name") or author.get("username") or "?")
+    text = " / ".join(line for line in (msg.get("content") or "").splitlines() if line.strip())
+    files = " ".join(f"[{a.get('filename', 'file')}]" for a in msg.get("attachments") or [])
+    stickers = " ".join(f"[sticker {s.get('name', '')}]" for s in msg.get("sticker_items") or [])
+    when = (msg.get("timestamp") or "")[:16].replace("T", " ")
+    return f"{when} {name}: " + " ".join(p for p in (text, files, stickers) if p)

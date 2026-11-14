@@ -4,6 +4,9 @@ All notable changes to this project are listed here ([Keep a Changelog](https://
 
 ## [Unreleased]
 
+- `seele history --channel NAME_OR_ID | --server GUILD_ID [--limit N] [--bots] [--json]`: print a
+  channel's messages, or every text channel and thread in a server, oldest first (bots left out by default).
+
 ## [0.2.0] - 2026-11-14
 
 Lead mode: long-running sessions with background agents.

@@ -7,6 +7,9 @@
                     post a message (and up to 10 files) as the bot; prints the message id
   seele thread --channel NAME_OR_ID --name NAME
                     create a public thread in a channel; prints its id
+  seele history (--channel NAME_OR_ID | --server GUILD_ID) [--limit N] [--bots] [--json]
+                    print a channel's messages (or every channel and thread in a server),
+                    oldest first; --limit counts per channel, bots are left out unless --bots
   seele conv --id ID [--cwd P] [--account A] [--effort E] [--model M] [--mode M] [--session SID|new]
              [--agents-channel ID|off] [--autoresume on|off] [--listen on|off]
                     change a conversation's settings (the running bot applies them)
@@ -127,6 +130,14 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--name", required=True)
 
     on_off = ("on", "off")
+    p = sub.add_parser("history", help="print a channel's (or a whole server's) messages")
+    where = p.add_mutually_exclusive_group(required=True)
+    where.add_argument("--channel", help="channel or thread id, or a name from [channels]")
+    where.add_argument("--server", type=int, metavar="GUILD_ID", help="every channel and thread in this server")
+    p.add_argument("--limit", type=int, metavar="N", help="newest N messages per channel (default: all)")
+    p.add_argument("--bots", action="store_true", help="include messages from bots")
+    p.add_argument("--json", action="store_true", help="raw Discord message objects, one per line")
+
     p = sub.add_parser("conv", help="change a conversation's settings")
     p.add_argument("--id", required=True, help="thread / channel / DM id, or a name from [channels]")
     p.add_argument("--cwd", help="working folder (a project name, ~/path or /path)")
@@ -186,6 +197,35 @@ def usage_report(cfg: config.Config, only: str | None, as_json: bool) -> int:
     return 1 if any("error" in info for info in found.values()) else 0
 
 
+def history(cfg: config.Config, args, *, opener=None) -> int:
+    from . import rest
+    kw = {"opener": opener} if opener else {}
+    try:
+        if args.server:
+            chans = rest.guild_channels(cfg.token, args.server, **kw)
+        else:
+            chans = [{"id": cfg.channel_id(args.channel), "name": ""}]
+        for chan in chans:
+            try:
+                msgs = rest.messages(cfg.token, int(chan["id"]), args.limit, **kw)
+            except rest.RestError as e:
+                if not args.server:
+                    raise
+                print(f"seele history: #{chan.get('name') or chan['id']}: {e}", file=sys.stderr)
+                continue
+            msgs = [m for m in reversed(msgs) if args.bots or not (m.get("author") or {}).get("bot")]
+            if not msgs:
+                continue
+            if args.server and not args.json:
+                print(f"\n## #{chan.get('name') or chan['id']}")
+            for m in msgs:
+                print(json.dumps(m) if args.json else rest.format_message(m, cfg.name_for))
+        return 0
+    except (ValueError, rest.RestError) as e:
+        print(f"seele history: {e}", file=sys.stderr)
+        return 1
+
+
 def main(argv: list[str]) -> int:
     ensure_path()
     if argv and argv[0] in ("-h", "--help", "help"):
@@ -238,6 +278,8 @@ def main(argv: list[str]) -> int:
         print(f"No Discord bot token. Put token = \"...\" in {config.CONFIG_PATH} "
               "(see config.example.toml) or set DISCORD_TOKEN.", file=sys.stderr)
         return 2
+    if cmd == "history":
+        return history(cfg, args)
     if cmd in ("post", "thread"):
         from . import rest
         try:

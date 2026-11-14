@@ -137,3 +137,61 @@ def test_usage_command(monkeypatch, capsys, tmp_path):
     out = capsys.readouterr().out
     assert "main: 5 h 50% (resets" in out and "week 75%" in out and "side: not logged in" in out
     assert cli.main(["usage", "--account", "nope"]) == 2
+
+
+class Pages:
+    """Fake opener that answers GET paths from a dict (path prefix -> list of bodies, served in order)."""
+    def __init__(self, routes):
+        self.routes, self.paths = routes, []
+
+    def __call__(self, req, timeout=None):
+        path = req.full_url.removeprefix(rest.API)
+        self.paths.append(path)
+        for prefix, bodies in self.routes.items():
+            if path.startswith(prefix):
+                body = bodies.pop(0) if len(bodies) > 1 else bodies[0]
+                if isinstance(body, int):
+                    raise urllib.error.HTTPError(req.full_url, body, "err", {}, io.BytesIO(b"{}"))
+                return io.BytesIO(json.dumps(body).encode())
+        raise AssertionError(path)
+
+
+def msg(i, name="ann", bot=False, text="hi", **extra):
+    return {"id": str(i), "timestamp": f"2026-11-14T18:{i:02d}:00+00:00", "content": text,
+            "author": {"id": str(100 + i), "username": name, "bot": bot}, **extra}
+
+
+def test_messages_pages_back_until_short_page():
+    op = Pages({"/channels/7/messages": [[msg(i) for i in range(100, 0, -1)], [msg(0)]]})
+    out = rest.messages("T", 7, opener=op)
+    assert len(out) == 101
+    assert op.paths[1] == "/channels/7/messages?limit=100&before=1"
+    op = Pages({"/channels/7/messages": [[msg(3), msg(2)]]})
+    assert len(rest.messages("T", 7, 2, opener=op)) == 2 and op.paths == ["/channels/7/messages?limit=2"]
+
+
+def test_format_message():
+    m = msg(5, text="line one\n\nline two", attachments=[{"filename": "a.png"}],
+            sticker_items=[{"name": "skull"}])
+    assert rest.format_message(m) == "2026-11-14 18:05 ann: line one / line two [a.png] [sticker skull]"
+    assert rest.format_message(m, lambda uid, fb: "Oliver" if uid == 105 else fb).split(" ")[2] == "Oliver:"
+
+
+def test_history_server_skips_bots_and_forbidden(tmp_path, capsys):
+    op = Pages({
+        "/guilds/9/channels": [[{"id": "1", "name": "general", "type": 0}, {"id": "2", "name": "vc", "type": 2},
+                                {"id": "3", "name": "secret", "type": 0}]],
+        "/guilds/9/threads/active": [{"threads": [{"id": "4", "name": "lead", "type": 11}]}],
+        "/channels/1/threads/archived": [{"threads": [{"id": "4", "name": "lead", "type": 11}]}],
+        "/channels/3/threads/archived": [403],
+        "/channels/1/messages": [[msg(2, text="newer"), msg(1, "seele", bot=True)]],
+        "/channels/3/messages": [403],
+        "/channels/4/messages": [[msg(3, "ebi", text="lol")]],
+    })
+    cfg = config.Config(token="T")
+    args = cli.parser().parse_args(["history", "--server", "9"])
+    assert cli.history(cfg, args, opener=op) == 0
+    out, err = capsys.readouterr()
+    assert "## #general\n2026-11-14 18:02 ann: newer\n" in out and "seele" not in out
+    assert "## #lead\n2026-11-14 18:03 ebi: lol" in out and out.count("## #lead") == 1
+    assert "#secret" in err and "/channels/2/" not in " ".join(op.paths)

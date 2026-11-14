@@ -38,7 +38,7 @@ seele ▸ ✅ Done · 1:07 · 9 tools · 5 h 13% · `3f2a91c0`
   agents are listed in the live status.
 - **Auto-resume.** With `/autoresume on`, a run stopped by a usage limit (5-hour or weekly) is
   picked up again 5 minutes after the limit resets. The schedule survives restarts.
-- **Scriptable.** `seele post`, `seele thread`, `seele conv`, `seele prompt` and `seele usage` let
+- **Scriptable.** `seele post`, `seele thread`, `seele history`, `seele conv`, `seele prompt` and `seele usage` let
   Claude itself (or any script) post screenshots, open threads, change settings, hand over to a
   fresh session and pace itself against plan limits.
 - **Real sessions.** Conversations resume the same Claude Code session, and `/status` prints the
@@ -113,6 +113,7 @@ Channel arguments take an id or a name from `[channels]` in the config.
 seele post --channel progress --file shot.png --file clip.mp4 "The reef scene is in"
 seele post --channel 123 --reply-to 456 -          # text from stdin; prints the message id(s)
 seele thread --channel lead --name "Sprint 4"      # prints the new thread's id
+seele history --channel lead --limit 200          # last 200 messages, oldest first
 seele conv --id 789 --cwd ~/Projects/game --agents-channel agents --autoresume on --effort xhigh
 seele prompt --id 789 --file handover.md --new-session --as lead
 seele usage --json                                 # 5-hour + weekly utilization (0-1) and resets
