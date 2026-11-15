@@ -5,8 +5,6 @@ import json
 import stat
 import sys
 import time
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -207,12 +205,6 @@ class Channel:
         return [m for m in self.sent if not m.deleted]
 
 
-class ChatThread(Channel):
-    def __init__(self, cid, parent_id):
-        super().__init__(cid)
-        self.parent_id = parent_id
-
-
 @pytest.fixture
 def bot(tmp_path):
     fake = tmp_path / "claude"
@@ -258,160 +250,6 @@ def test_prompt_then_resume(bot):
     assert "--input-format" in first["argv"]  # live input is the default
     assert second["argv"][second["argv"].index("--resume") + 1] == "sess-1"
     assert b.state.get(1).session_id == "sess-1"
-
-
-@pytest.mark.parametrize("configured_thread", [False, True])
-def test_codex_thread_queues_and_resumes(bot, tmp_path, monkeypatch, configured_thread):
-    b, _ = bot
-    fake = tmp_path / "codex"
-    fake.write_text(f"#!{sys.executable}\n" + r'''
-import json, sys
-args = sys.argv[1:]
-prompt = sys.stdin.read()
-assert args[0] == "exec"
-assert args[args.index("--model") + 1] == "gpt-6.1-sol"
-assert 'model_reasoning_effort="xhigh"' in args
-assert args[-1] == "-"
-if prompt.endswith("again"):
-    assert args[1] == "resume" and args[-2] == "codex-session"
-else:
-    assert "resume" not in args
-for event in [
-    {"type": "thread.started", "thread_id": "codex-session"},
-    {"type": "item.completed", "item": {"type": "agent_message", "text": "Working on it"}},
-    {"type": "item.completed", "item": {"type": "agent_message", "text": prompt}},
-    {"type": "turn.completed"},
-]:
-    print(json.dumps(event), flush=True)
-''')
-    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
-    ch = ChatThread(11, 1)
-    monkeypatch.setattr(botmod.discord, "Thread", ChatThread)
-    b.cfg.projects_root = tmp_path / "projects"
-    b.cfg.codex = config.CodexConfig(binary=str(fake), channels={ch.id if configured_thread else ch.parent_id})
-    b.owners = {42}
-    author = SimpleNamespace(bot=False, id=42, display_name="Alice")
-    reactions = []
-
-    async def react(emoji):
-        reactions.append(emoji)
-
-    async def go():
-        for prompt in ("hello", "again"):
-            await b.on_message(SimpleNamespace(author=author, channel=ch, mentions=[], content=prompt,
-                                               attachments=[], add_reaction=react))
-        await until(lambda: not b.jobs)
-
-    asyncio.run(go())
-    assert reactions == ["📥"]
-    assert not ch.threads
-    assert [msg.content for msg in ch.live() if msg.content.startswith("[Discord")] == [
-        "[Discord message from Alice]\nhello", "[Discord message from Alice]\nagain",
-    ]
-    assert all("gpt-6.1-sol · effort xhigh" in msg.content for msg in ch.live()[::2])
-    assert config.State(b.state.path).get(ch.id).session_id == "codex-session"
-
-
-def test_codex_channel_opens_fresh_threads_and_inherits_settings(bot, tmp_path, monkeypatch):
-    b, _ = bot
-    channel = Channel(7)
-    b.cfg.codex.channels = {channel.id}
-    b.owners = {42}
-    parent = b.state.get(channel.id)
-    parent.session_id, parent.cwd = "old-channel-session", str(tmp_path)
-    parent.model, parent.effort = "custom-model", "high"
-    parent.listen = True  # Codex channels require mentions even with an older listen setting.
-    bot_user = SimpleNamespace(id=99)
-    monkeypatch.setattr(b._connection, "user", bot_user)
-    monkeypatch.setattr(botmod.discord, "Thread", ChatThread)
-    delivered = []
-
-    async def create_thread(name, auto_archive_duration):
-        assert auto_archive_duration == 1440
-        thread = ChatThread(next(ids), channel.id)
-        channel.threads[thread.id] = thread
-        return thread
-
-    async def deliver(key, target, prompt):
-        delivered.append((key, target, prompt))
-        return "started"
-
-    monkeypatch.setattr(b, "deliver", deliver)
-    author = SimpleNamespace(bot=False, id=42, display_name="Alice")
-
-    async def go():
-        for content in ("ordinary conversation", "codex please do something", "<@123> hello"):
-            await b.on_message(SimpleNamespace(author=author, channel=channel, mentions=[], content=content,
-                                               attachments=[], create_thread=create_thread))
-        assert not delivered and not channel.threads
-        for content in ("first topic", "second topic"):
-            await b.on_message(SimpleNamespace(author=author, channel=channel, mentions=[bot_user],
-                                               content=f"<@99> {content}",
-                                               attachments=[], create_thread=create_thread))
-        thread = delivered[0][1]
-        await b.on_message(SimpleNamespace(author=author, channel=thread, mentions=[], content="follow up",
-                                           attachments=[]))
-        b.get_channel = lambda key: channel if key == channel.id else channel.threads.get(key)
-        with pytest.raises(botmod.RequestError, match="Codex chat settings"):
-            await b.apply_conv(thread.id, {"account": "two"})
-        await b.apply_conv(thread.id, {"effort": "xhigh"})
-
-    asyncio.run(go())
-    first, second, follow_up = delivered
-    assert first[2] == "[Discord message from Alice]\nfirst topic"
-    assert first[0] != second[0] and follow_up[0] == first[0]
-    assert len(channel.threads) == 2
-    for key in channel.threads:
-        conv = config.State(b.state.path).get(key)
-        assert conv.session_id == "" and conv.cwd == str(tmp_path) and conv.model == "custom-model"
-        assert conv.effort == ("xhigh" if key == first[0] else "high")
-    assert b.state.get(channel.id).session_id == "old-channel-session"
-
-
-def test_thread_creation_failure_does_not_start_a_shared_session(bot, monkeypatch):
-    b, fake = bot
-    channel = Channel(7)
-    b.cfg.codex.channels = {channel.id}
-    b.owners = {42}
-    bot_user = SimpleNamespace(id=99)
-    monkeypatch.setattr(b._connection, "user", bot_user)
-
-    async def create_thread(**kwargs):
-        raise botmod.discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "Missing Permissions")
-
-    msg = SimpleNamespace(author=SimpleNamespace(bot=False, id=42), channel=channel, mentions=[bot_user],
-                          content="new topic", attachments=[], create_thread=create_thread)
-    asyncio.run(b.on_message(msg))
-    assert not b.jobs and not calls(fake)
-    assert "Couldn't create a chat thread" in channel.sent[0].content
-
-
-def test_codex_thread_commands_use_inherited_settings(bot, tmp_path, monkeypatch):
-    b, _ = bot
-    parent = Channel(7)
-    thread = ChatThread(8, parent.id)
-    b.cfg.codex.channels = {parent.id}
-    b.owners = {42}
-    conv = b.state.get(parent.id)
-    conv.cwd, conv.effort = str(tmp_path), "high"
-    b.get_channel = lambda key: {parent.id: parent, thread.id: thread}.get(key)
-    monkeypatch.setattr(botmod.discord, "Thread", ChatThread)
-    response = SimpleNamespace(send_message=AsyncMock())
-    interaction = SimpleNamespace(channel_id=thread.id, channel=thread, user=SimpleNamespace(id=42),
-                                  response=response)
-
-    async def go():
-        await b.tree.get_command("status").callback(interaction)
-        shown = response.send_message.call_args.args[0]
-        assert "**Backend** Codex" in shown and "**Effort** high" in shown and str(tmp_path) in shown
-        await b.tree.get_command("model").callback(interaction, "default")
-        assert b.cfg.codex.model in response.send_message.call_args.args[0]
-        await b.tree.get_command("effort").callback(interaction, SimpleNamespace(value="xhigh"))
-        assert b.state.get(thread.id).effort == "xhigh"
-        await b.tree.get_command("account").callback(interaction, "two")
-        assert response.send_message.call_args.args[0] == "This command is for Claude chats."
-
-    asyncio.run(go())
 
 
 def test_plain_stdin_when_live_input_is_off(bot):
