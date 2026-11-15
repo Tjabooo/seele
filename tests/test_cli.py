@@ -195,3 +195,17 @@ def test_history_server_skips_bots_and_forbidden(tmp_path, capsys):
     assert "## #general\n2026-11-14 18:02 ann: newer\n" in out and "seele" not in out
     assert "## #lead\n2026-11-14 18:03 ebi: lol" in out and out.count("## #lead") == 1
     assert "#secret" in err and "/channels/2/" not in " ".join(op.paths)
+
+
+def test_open_dm_and_user_lookup():
+    op = Opener()
+    assert rest.open_dm("TOKEN", 901, opener=op) == 1
+    req = op.requests[0]
+    assert req.full_url.endswith("/users/@me/channels") and req.get_method() == "POST"
+    assert json.loads(req.data) == {"recipient_id": "901"}
+    cfg = config.Config.__new__(config.Config)
+    cfg.people = {901: "Oliver", 902: "ebi"}
+    assert cfg.user_id("oliver") == 901 and cfg.user_id("<@902>") == 902 and cfg.user_id("<@!902>") == 902
+    assert cfg.user_id("123") == 123
+    with pytest.raises(ValueError, match="names in \\[people\\]: Oliver, ebi"):
+        cfg.user_id("nobody")

@@ -108,6 +108,17 @@ class Config:
         known = ", ".join(sorted(self.channels)) or "none configured"
         raise ValueError(f"unknown channel {value!r} (names in [channels]: {known})")
 
+    def user_id(self, value: str | int) -> int:
+        """A Discord user id from an id, a `<@id>` mention or a name in `[people]` (case-insensitive)."""
+        text = str(value).strip().removeprefix("<@").removeprefix("!").removesuffix(">").lstrip("@")
+        if text.isdigit():
+            return int(text)
+        for uid, name in self.people.items():
+            if name.lower() == text.lower():
+                return uid
+        known = ", ".join(sorted(self.people.values())) or "none configured"
+        raise ValueError(f"unknown person {value!r} (names in [people]: {known})")
+
     def account_for(self, cwd, override: str | None = None, host: Host | None = None) -> Account:
         if override:
             for acc in self.accounts:

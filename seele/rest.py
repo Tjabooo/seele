@@ -115,6 +115,12 @@ def post(token: str, channel_id: int, text: str, files: list[str] | None = None,
     return out
 
 
+def open_dm(token: str, user_id: int, *, opener=urllib.request.urlopen) -> int:
+    """The id of the bot's DM channel with a user (Discord returns the existing one if there is one).
+    The user must share a server with the bot or have added it to their account."""
+    return int(request(token, "POST", "/users/@me/channels", {"recipient_id": str(user_id)}, opener=opener)["id"])
+
+
 def create_thread(token: str, channel_id: int, name: str, *, opener=urllib.request.urlopen) -> dict:
     """A public thread in a text channel (not attached to a message)."""
     name = " ".join(name.split())[:100]

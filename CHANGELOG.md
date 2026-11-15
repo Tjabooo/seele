@@ -4,6 +4,8 @@ All notable changes to this project are listed here ([Keep a Changelog](https://
 
 ## [Unreleased]
 
+- **`seele dm --to NAME_OR_ID [--file PATH ...] [TEXT | -]`**: direct-message a person as the bot (a user id, a
+  `<@id>` mention or a name from `[people]`); opens the bot's DM channel through the REST API.
 - **Thread lights**: conversation threads are renamed to start with 🟠 (working), 🟢 (finished) or
   🔴 (failed, stopped, cut off by a restart, or waiting for an auto-resume). New prompt threads are
   created with 🟠 already. Renames respect Discord's 2-per-10-minutes limit per thread and only the

@@ -147,6 +147,7 @@ Channel arguments take an id or a name from `[channels]` in the config.
 ```sh
 seele post --channel progress --file shot.png --file clip.mp4 "The reef scene is in"
 seele post --channel 123 --reply-to 456 -          # text from stdin; prints the message id(s)
+seele dm --to Oliver "Need a decision on X"      # a DM to a name in [people] (or a user id)
 seele thread --channel lead --name "Sprint 4"      # prints the new thread's id
 seele history --channel lead --limit 200          # last 200 messages, oldest first
 seele conv --id 789 --cwd ~/Projects/game --agents-channel agents --autoresume on --effort xhigh

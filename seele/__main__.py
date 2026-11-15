@@ -5,6 +5,8 @@
   seele check       check the config and the claude binary
   seele post --channel NAME_OR_ID [--file PATH ...] [--reply-to MSG_ID] [TEXT | -]
                     post a message (and up to 10 files) as the bot; prints the message id
+  seele dm --to NAME_OR_ID [--file PATH ...] [TEXT | -]
+                    direct-message a person (an id or a name from [people]) as the bot
   seele thread --channel NAME_OR_ID --name NAME
                     create a public thread in a channel; prints its id
   seele history (--channel NAME_OR_ID | --server GUILD_ID) [--limit N] [--bots] [--json]
@@ -162,6 +164,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--channel", required=True, help="channel or thread id, or a name from [channels]")
     p.add_argument("--file", action="append", default=[], metavar="PATH", help="attach a file (up to 10)")
     p.add_argument("--reply-to", type=int, metavar="MSG_ID", help="reply to this message")
+    p.add_argument("text", nargs="?", default="", help="message text; - reads it from stdin")
+
+    p = sub.add_parser("dm", help="send a direct message (and files) to a person as the bot")
+    p.add_argument("--to", required=True, help="Discord user id, or a name from [people]")
+    p.add_argument("--file", action="append", default=[], metavar="PATH", help="attach a file (up to 10)")
     p.add_argument("text", nargs="?", default="", help="message text; - reads it from stdin")
 
     p = sub.add_parser("thread", help="create a public thread and print its id")
@@ -331,15 +338,15 @@ def main(argv: list[str]) -> int:
         return 2
     if cmd == "history":
         return history(cfg, args)
-    if cmd in ("post", "thread"):
+    if cmd in ("post", "thread", "dm"):
         from . import rest
         try:
-            cid = cfg.channel_id(args.channel)
+            cid = rest.open_dm(cfg.token, cfg.user_id(args.to)) if cmd == "dm" else cfg.channel_id(args.channel)
             if cmd == "thread":
                 print(rest.create_thread(cfg.token, cid, args.name)["id"])
                 return 0
             text = sys.stdin.read() if args.text == "-" else args.text
-            for msg in rest.post(cfg.token, cid, text, args.file, reply_to=args.reply_to,
+            for msg in rest.post(cfg.token, cid, text, args.file, reply_to=getattr(args, "reply_to", None),
                                  max_mb=cfg.max_upload_mb):
                 print(msg.get("id", ""))
             return 0
