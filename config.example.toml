@@ -36,7 +36,8 @@ live_input = true            # messages sent while Claude works go straight into
 [claude.env]
 # NOTIFY_DONE = "0"
 
-# Opt-in Codex conversations. Each listed channel or thread keeps one session.
+# Opt-in Codex chats. Messages in listed channels open fresh threads.
+# Follow-ups inside a thread continue its session.
 [codex]
 channels = []                # e.g. ["codex"] when [channels] names that channel
 binary = "codex"
