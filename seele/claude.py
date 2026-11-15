@@ -199,6 +199,9 @@ class Run:
     is left and nothing was written since; then Claude Code exits on its own.
     """
 
+    binary_name = "claude"
+    parse = staticmethod(parse_line)
+
     def __init__(self, argv: list[str], prompt: str, cwd: Path, env: dict[str, str], *,
                  live: bool = False, idle_grace: float = 20.0):
         self.argv, self.prompt, self.cwd, self.env = argv, prompt, cwd, env
@@ -236,7 +239,7 @@ class Run:
                 line = await self.proc.stdout.readline()
                 if not line:
                     break
-                for ev in parse_line(line.decode(errors="replace")):
+                for ev in self.parse(line.decode(errors="replace")):
                     got_result |= ev.kind == "result"
                     self._track(ev)
                     yield ev
@@ -247,9 +250,12 @@ class Run:
         if self.stopped:
             yield Event("result", text="Stopped.", is_error=True, data={"subtype": "stopped"})
         elif not got_result or code < 0 or code >= 128:  # no answer at all, or killed by a signal
-            tail = self.stderr.decode(errors="replace").strip()[-1500:]
-            yield Event("result", text=tail or f"claude exited with code {code}", is_error=True,
-                        data={"subtype": "crash"})
+            yield self.crash(code)
+
+    def crash(self, code: int) -> Event:
+        tail = self.stderr.decode(errors="replace").strip()[-1500:]
+        return Event("result", text=tail or f"{self.binary_name} exited with code {code}",
+                     is_error=True, data={"subtype": "crash"})
 
     def _track(self, ev: Event):
         """Follow turns and background tasks, and close stdin once there is nothing left to do."""

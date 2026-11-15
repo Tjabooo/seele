@@ -304,6 +304,10 @@ def main(argv: list[str]) -> int:
         binary = shutil.which(cfg.claude_bin)
         print(f"claude binary: {binary or 'NOT FOUND'}")
         ok &= bool(binary)
+        if cfg.codex.channels:
+            binary = shutil.which(cfg.codex.binary)
+            print(f"codex binary: {binary or 'NOT FOUND'}")
+            ok &= bool(binary)
         for acc in cfg.accounts:
             creds = (acc.config_dir / ".credentials.json").exists()
             print(f"account {acc.name}: {acc.config_dir} ({'logged in' if creds else 'no .credentials.json'})")

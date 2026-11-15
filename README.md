@@ -83,6 +83,24 @@ and systemd (any Linux desktop/server).
 
 To keep it running while you're logged out: `loginctl enable-linger $USER`.
 
+### Codex chats
+
+Install the Codex CLI and sign in on the machine running SEELE. Create a Discord text channel
+or thread and add its ID to `[codex].channels` in SEELE's config. Enable Message Content Intent
+so SEELE can read ordinary messages there.
+
+```toml
+[codex]
+channels = [123456789012345678]
+model = "gpt-6.1-sol"
+effort = "xhigh"
+```
+
+After restarting SEELE, messages from configured owners in that channel go into one persistent
+Codex session. Messages sent during a run are queued for the next turn. Use `/status` to see the
+session and settings, `/new` for a fresh session, and `/cd` to change folders. The starting folder
+is `projects_root`. Codex runs in the workspace-write sandbox and uses the CLI's saved sign-in.
+
 ## Usage
 
 Just write to it. Everything else is slash commands:

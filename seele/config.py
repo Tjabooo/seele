@@ -44,6 +44,14 @@ class Account:
 
 
 @dataclass
+class CodexConfig:
+    binary: str = "codex"
+    model: str = "gpt-6.1-sol"
+    effort: str = "xhigh"
+    channels: set[int] = field(default_factory=set)
+
+
+@dataclass
 class Config:
     token: str = ""
     owners: set[int] = field(default_factory=set)
@@ -65,6 +73,7 @@ class Config:
     max_upload_mb: int = 10
     channels: dict[str, int] = field(default_factory=dict)  # names for `seele post --channel NAME`
     live_input: bool = True  # messages sent while Claude works go straight into the running turn
+    codex: CodexConfig = field(default_factory=CodexConfig)
 
     def name_for(self, uid: int, fallback: str) -> str:
         return self.people.get(uid) or fallback
@@ -126,6 +135,13 @@ def load(path: Path = CONFIG_PATH) -> Config:
     cfg.cost_command = raw.get("cost_command", "")
     cfg.max_upload_mb = int(raw.get("max_upload_mb", cfg.max_upload_mb))
     cfg.channels = {str(k): int(v) for k, v in raw.get("channels", {}).items()}
+    codex = raw.get("codex", {})
+    cfg.codex = CodexConfig(
+        binary=_path(codex["binary"]).as_posix() if "binary" in codex else cfg.codex.binary,
+        model=codex.get("model", cfg.codex.model),
+        effort=codex.get("effort", cfg.codex.effort),
+        channels={cfg.channel_id(ch) for ch in codex.get("channels", [])},
+    )
     cfg.live_input = bool(c.get("live_input", cfg.live_input))
     for name, acc in raw.get("accounts", {}).items():
         cfg.accounts.append(Account(name, _path(acc.get("config_dir", "~/.claude")),

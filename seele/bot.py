@@ -1,4 +1,4 @@
-"""The Discord side: messages become Claude Code prompts, slash commands change settings."""
+"""Route Discord messages to Claude Code or Codex and handle slash commands."""
 from __future__ import annotations
 
 import asyncio
@@ -16,7 +16,7 @@ from pathlib import Path
 import discord
 from discord import app_commands
 
-from . import agents, claude, config, usage
+from . import agents, claude, codex, config, usage
 from .config import (SPEAKER_NOTE, Config, Conversation, State, default_effort, set_default_effort,
                      tag_prompt)
 from .text import code_safe, duration, short_path, split_message, thread_name
@@ -235,7 +235,7 @@ class Seele(discord.Client):
         if self.user:
             content = content.replace(f"<@{self.user.id}>", "").replace(f"<@!{self.user.id}>", "").strip()
 
-        if isinstance(channel, discord.DMChannel):
+        if channel.id in self.cfg.codex.channels or isinstance(channel, discord.DMChannel):
             key = channel.id
         elif isinstance(channel, discord.Thread):
             parent = self.state.convs.get(str(channel.parent_id))
@@ -277,7 +277,7 @@ class Seele(discord.Client):
         return (prompt or "See the attached files.") + "\n\nAttached files (saved on this machine):\n" + "\n".join(lines)
 
     async def deliver(self, key: int, channel, prompt: str, human: bool = True) -> str:
-        """A message for a conversation: start a job, write it into the running Claude process
+        """A message for a conversation: start a job, write it into the running process
         ("live"), or queue it for when the job ends. Returns which one happened."""
         job = self.jobs.get(key)
         if job is None:
@@ -314,7 +314,14 @@ class Seele(discord.Client):
             return True
         return False
 
-    # ---------- running Claude ----------
+    # ---------- running agents ----------
+    def working_dir(self, key: int, conv: Conversation) -> Path:
+        default = self.cfg.projects_root if key in self.cfg.codex.channels else self.cfg.default_cwd
+        return Path(conv.cwd or default)
+
+    def codex_settings(self, conv: Conversation) -> tuple[str, str]:
+        return conv.model or self.cfg.codex.model, conv.effort or self.cfg.codex.effort
+
     def settings_for(self, conv: Conversation):
         cwd = Path(conv.cwd or self.cfg.default_cwd)
         account = self.cfg.account_for(cwd, conv.account or None)
@@ -365,10 +372,10 @@ class Seele(discord.Client):
                             human=any(p.human for p in pending), new_session=any(p.new_session for p in pending))
 
     async def attempt(self, key: int, channel, prompt: str, retried: bool) -> bool:
-        """One Claude Code process for this prompt. True = its old session is gone, run again fresh."""
+        """Run one agent process. Return True if a missing session should be retried from scratch."""
         conv = self.state.get(key)
         conv.last_prompt = prompt
-        cwd, account, model, effort, mode = self.settings_for(conv)
+        cwd = self.working_dir(key, conv)
         if not cwd.is_dir():
             await channel.send(f"⚠️ Working folder `{cwd}` doesn't exist. Use `/cd`.")
             return False
@@ -378,16 +385,28 @@ class Seele(discord.Client):
         guard = await self.guard_active()
         if guard and self.cfg.guard_note:
             system += "\n\n" + self.cfg.guard_note
-        live = self.cfg.live_input
-        argv = claude.build_argv(self.cfg.claude_bin, session_id=conv.session_id or None, model=model or None,
-                                 effort=effort or None, mode=mode, system_prompt=system, live=live)
         job = Job(channel, prompt, key=key)
-        job.meta = " · ".join(filter(None, [
-            short_path(str(cwd), HOME), account.name, model or "default model",
-            f"effort {effort or default_effort(self.cfg.settings_file) or 'default'}", mode,
-            "🎮 guard on" if guard else ""]))
-        job.tracker = agents.Tracker(self.board, key, conv, getattr(channel, "jump_url", "") or "",
-                                     on_limit=lambda card, text: self.agent_limited(key, job, card, text, account))
+        if key in self.cfg.codex.channels:
+            account = None
+            model, effort = self.codex_settings(conv)
+            argv = codex.build_argv(self.cfg.codex.binary, session_id=conv.session_id,
+                                    model=model, effort=effort, system_prompt=system)
+            run = codex.Run(argv, prompt, cwd, {**os.environ, **self.cfg.env})
+            meta = ["Codex", model, f"effort {effort}", codex.SANDBOX]
+        else:
+            _, account, model, effort, mode = self.settings_for(conv)
+            live = self.cfg.live_input
+            argv = claude.build_argv(self.cfg.claude_bin, session_id=conv.session_id or None,
+                                     model=model or None, effort=effort or None, mode=mode,
+                                     system_prompt=system, live=live)
+            run = claude.Run(argv, prompt, cwd, self.child_env(account), live=live)
+            meta = [account.name, model or "default model",
+                    f"effort {effort or default_effort(self.cfg.settings_file) or 'default'}", mode]
+            job.tracker = agents.Tracker(self.board, key, conv, getattr(channel, "jump_url", "") or "",
+                                         on_limit=lambda card, text: self.agent_limited(key, job, card, text, account))
+        job.meta = " · ".join([short_path(str(cwd), HOME), *meta])
+        if guard:
+            job.meta += " · 🎮 guard on"
         self.jobs[key] = job
         ticker = None
         try:
@@ -395,7 +414,7 @@ class Seele(discord.Client):
             job.status = await channel.send(self.render(job, "⏳ **Queued**" if self.slots.locked() else None),
                                             view=job.view)
             async with self.slots:
-                job.run = claude.Run(argv, prompt, cwd, self.child_env(account), live=live)
+                job.run = run
                 ticker = asyncio.create_task(self.tick(job))
                 async for ev in job.run.events():
                     try:
@@ -403,7 +422,8 @@ class Seele(discord.Client):
                     except Exception:  # a Discord hiccup must not orphan the Claude process
                         log.exception("could not handle a %s event", ev.kind)
             ticker.cancel()
-            await job.tracker.close()
+            if job.tracker:
+                await job.tracker.close()
             self.state.save()
             if job.resume_failed and not job.results:
                 conv.session_id = ""
@@ -446,7 +466,8 @@ class Seele(discord.Client):
         elif ev.kind == "result":
             if ev.session_id:
                 conv.session_id = ev.session_id
-            if not retried and not job.results and ev.is_error and "No conversation found" in ev.text:
+            missing = ev.data.get("subtype") == "missing_session" or "No conversation found" in ev.text
+            if not retried and not job.results and ev.is_error and missing:
                 job.resume_failed = True
                 return
             job.last_result = ev
@@ -463,7 +484,7 @@ class Seele(discord.Client):
         if job.results and not result.is_error and not result.text.strip():
             return  # an empty follow-up turn (e.g. after a background task ended): nothing to say
         job.results += 1
-        limit = result.is_error and claude.looks_like_limit(result.text)
+        limit = account is not None and result.is_error and claude.looks_like_limit(result.text)
         view = None
         if limit:
             others = [a.name for a in self.cfg.accounts if a.name != account.name]
@@ -781,6 +802,11 @@ class Seele(discord.Client):
         raise RequestError(f"unknown setting {name!r}")
 
     async def apply_conv(self, key: int, changes: dict) -> str:
+        if key in self.cfg.codex.channels:
+            unsupported = changes.keys() - {"cwd", "model", "effort", "session"}
+            if unsupported:
+                raise RequestError(f"Codex channel settings support cwd, model, effort and session; "
+                                   f"received {', '.join(sorted(unsupported))}")
         new = dict(self._setting(k, v) for k, v in changes.items())  # validate everything first
         conv = await self.ensure_conv(key)
         if "cwd" in new and new["cwd"] != conv.cwd and "session_id" not in new:
@@ -829,23 +855,26 @@ def register_commands(bot: Seele):
             return tree.command(name=name, description=description)(installs(contexts(fn)))
         return wrap
 
-    async def guard(interaction: discord.Interaction) -> bool:
-        if bot.is_owner_id(interaction.user.id):
-            return True
-        await interaction.response.send_message("This bot only takes orders from its owner.", ephemeral=True)
-        return False
+    async def guard(interaction: discord.Interaction, *, claude_only: bool = False) -> bool:
+        if not bot.is_owner_id(interaction.user.id):
+            await interaction.response.send_message("This bot only takes orders from its owner.", ephemeral=True)
+            return False
+        if claude_only and interaction.channel_id in bot.cfg.codex.channels:
+            await interaction.response.send_message("This command is for Claude chats.", ephemeral=True)
+            return False
+        return True
 
     def conv_of(interaction: discord.Interaction) -> Conversation:
         return bot.state.get(interaction.channel_id)
 
-    @command("new", "Start a fresh Claude session here (keeps folder, model and effort)")
+    @command("new", "Start a fresh session here (keeps folder, model and effort)")
     async def new(interaction: discord.Interaction):
         if not await guard(interaction):
             return
         conv = conv_of(interaction)
         conv.session_id = ""
         bot.state.save()
-        cwd, *_ = bot.settings_for(conv)
+        cwd = bot.working_dir(interaction.channel_id, conv)
         await interaction.response.send_message(f"🆕 Next message starts a fresh session in `{short_path(str(cwd), HOME)}`.")
 
     @command("cd", "Change the working folder (starts a fresh session)")
@@ -861,9 +890,12 @@ def register_commands(bot: Seele):
         conv = conv_of(interaction)
         conv.cwd, conv.session_id = str(target.resolve()), ""
         bot.state.save()
-        acc = bot.cfg.account_for(target, conv.account or None)
+        if interaction.channel_id in bot.cfg.codex.channels:
+            agent = "Codex"
+        else:
+            agent = bot.cfg.account_for(target, conv.account or None).name
         await interaction.response.send_message(
-            f"📁 Working in `{short_path(conv.cwd, HOME)}` (account **{acc.name}**). Fresh session next message.")
+            f"📁 Working in `{short_path(conv.cwd, HOME)}` (**{agent}**). Fresh session next message.")
 
     @cd.autocomplete("path")
     async def cd_complete(_interaction, current: str):
@@ -876,6 +908,10 @@ def register_commands(bot: Seele):
         if not await guard(interaction):
             return
         conv = conv_of(interaction)
+        is_codex = interaction.channel_id in bot.cfg.codex.channels
+        if is_codex and everywhere:
+            return await interaction.response.send_message("Use /effort without everywhere for a Codex chat.",
+                                                           ephemeral=True)
         if everywhere and level.value != "default":
             models = set_default_effort(bot.cfg.settings_file, level.value)
             conv.effort = ""
@@ -884,27 +920,30 @@ def register_commands(bot: Seele):
                 f"⚙️ Claude Code's default effort is now **{level.value}** ({', '.join(models)}), here and in the terminal.")
         conv.effort = "" if level.value == "default" else level.value
         bot.state.save()
-        shown = conv.effort or f"default ({default_effort(bot.cfg.settings_file) or 'CLI default'})"
+        default = bot.cfg.codex.effort if is_codex else default_effort(bot.cfg.settings_file) or "CLI default"
+        shown = conv.effort or f"default ({default})"
         await interaction.response.send_message(f"⚙️ Effort here: **{shown}**.")
 
     @command("model", "Set the model for this conversation")
-    @app_commands.describe(name="claude-opus-5-5, opus, sonnet, haiku, fable, a full model id, or default")
+    @app_commands.describe(name="Model id or alias, or default")
     async def model(interaction: discord.Interaction, name: str):
         if not await guard(interaction):
             return
         conv = conv_of(interaction)
         conv.model = "" if name == "default" else name.strip()
         bot.state.save()
-        await interaction.response.send_message(f"🧠 Model here: **{conv.model or 'default'}**.")
+        default = bot.cfg.codex.model if interaction.channel_id in bot.cfg.codex.channels else "default"
+        await interaction.response.send_message(f"🧠 Model here: **{conv.model or default}**.")
 
     @model.autocomplete("name")
-    async def model_complete(_interaction, current: str):
-        return [app_commands.Choice(name=m, value=m) for m in MODEL_HINTS if current.lower() in m][:25]
+    async def model_complete(interaction, current: str):
+        hints = ["default", bot.cfg.codex.model] if interaction.channel_id in bot.cfg.codex.channels else MODEL_HINTS
+        return [app_commands.Choice(name=m, value=m) for m in hints if current.lower() in m][:25]
 
     @command("mode", "Set the permission mode for this conversation")
     @app_commands.choices(mode=[app_commands.Choice(name=m, value=m) for m in (*claude.MODES, "default")])
     async def mode(interaction: discord.Interaction, mode: app_commands.Choice[str]):
-        if not await guard(interaction):
+        if not await guard(interaction, claude_only=True):
             return
         conv = conv_of(interaction)
         conv.mode = "" if mode.value == "default" else mode.value
@@ -915,7 +954,7 @@ def register_commands(bot: Seele):
     @command("account", "Pick which Claude account runs this conversation")
     @app_commands.describe(name="Account name, or auto (by folder)")
     async def account(interaction: discord.Interaction, name: str):
-        if not await guard(interaction):
+        if not await guard(interaction, claude_only=True):
             return
         names = [a.name for a in bot.cfg.accounts]
         if name != "auto" and name not in names:
@@ -974,21 +1013,30 @@ def register_commands(bot: Seele):
         if not await guard(interaction):
             return
         conv = conv_of(interaction)
-        cwd, acc, model_, effort_, mode_ = bot.settings_for(conv)
+        key = interaction.channel_id
+        cwd = bot.working_dir(key, conv)
         job = bot.jobs.get(interaction.channel_id)
-        saved = default_effort(bot.cfg.settings_file) or "CLI default"
-        lines = [
-            f"**Folder** `{short_path(str(cwd), HOME)}`",
-            f"**Account** {acc.name}{' (auto)' if not conv.account else ''}",
-            f"**Model** {model_ or 'default'}",
-            f"**Effort** {effort_ or 'default (' + saved + ')'}",
-            f"**Mode** {mode_}",
-        ]
-        if conv.session_id:
+        lines = [f"**Folder** `{short_path(str(cwd), HOME)}`"]
+        if key in bot.cfg.codex.channels:
+            model_, effort_ = bot.codex_settings(conv)
+            lines.extend(["**Backend** Codex", f"**Model** {model_}", f"**Effort** {effort_}",
+                          f"**Sandbox** {codex.SANDBOX}"])
+            resume = "codex resume"
+        else:
+            _, acc, model_, effort_, mode_ = bot.settings_for(conv)
+            saved = default_effort(bot.cfg.settings_file) or "CLI default"
+            lines.extend([
+                f"**Account** {acc.name}{' (auto)' if not conv.account else ''}",
+                f"**Model** {model_ or 'default'}",
+                f"**Effort** {effort_ or 'default (' + saved + ')'}",
+                f"**Mode** {mode_}",
+            ])
             prefix = "" if acc.config_dir.resolve() == (Path.home() / ".claude").resolve() \
                 else f"CLAUDE_CONFIG_DIR={short_path(str(acc.config_dir), HOME)} "
+            resume = f"{prefix}claude --resume"
+        if conv.session_id:
             lines.append(f"**Session** `{conv.session_id}` · terminal: `cd {short_path(str(cwd), HOME)} && "
-                         f"{prefix}claude --resume {conv.session_id}`")
+                         f"{resume} {conv.session_id}`")
         else:
             lines.append("**Session** fresh on next message")
         if conv.agents_channel:
@@ -1006,7 +1054,7 @@ def register_commands(bot: Seele):
                          + (f", {queued} queued" if queued else ""))
         lines.append(f"**Busy here** {len(bot.jobs)} prompt(s) running across all chats")
         if await bot.guard_active():
-            lines.append(f"🎮 `{bot.cfg.guard_process}` is running: Claude is told to keep it light")
+            lines.append(f"🎮 `{bot.cfg.guard_process}` is running. The agent is told to keep work light.")
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     @command("stop", "Stop the running prompt here, drop queued messages and any scheduled auto-resume")
@@ -1018,7 +1066,7 @@ def register_commands(bot: Seele):
 
     @command("sessions", "Continue one of the recent Claude sessions in this folder (also terminal ones)")
     async def sessions(interaction: discord.Interaction):
-        if not await guard(interaction):
+        if not await guard(interaction, claude_only=True):
             return
         conv = conv_of(interaction)
         cwd, acc, *_ = bot.settings_for(conv)
@@ -1038,7 +1086,7 @@ def register_commands(bot: Seele):
             return
         target = Path(os.path.expanduser(path))
         if not target.is_absolute():
-            target = Path(conv_of(interaction).cwd or bot.cfg.default_cwd) / target
+            target = bot.working_dir(interaction.channel_id, conv_of(interaction)) / target
         if not target.is_file():
             return await interaction.response.send_message(f"`{path}` is not a file.", ephemeral=True)
         if target.stat().st_size > bot.cfg.max_upload_mb * 1024 * 1024:
@@ -1047,7 +1095,7 @@ def register_commands(bot: Seele):
 
     @command("listen", "In a server channel: answer every message here, not only mentions")
     async def listen(interaction: discord.Interaction, on: bool = True):
-        if not await guard(interaction):
+        if not await guard(interaction, claude_only=True):
             return
         if interaction.guild is None:
             return await interaction.response.send_message("DMs always listen.", ephemeral=True)
@@ -1060,7 +1108,7 @@ def register_commands(bot: Seele):
     @command("agents", "Post a live card per background agent in a channel (empty = list them in the status)")
     @app_commands.describe(channel="Channel for the agent cards; leave empty to turn cards off")
     async def agents_cmd(interaction: discord.Interaction, channel: discord.TextChannel | None = None):
-        if not await guard(interaction):
+        if not await guard(interaction, claude_only=True):
             return
         conv = conv_of(interaction)
         conv.agents_channel = str(channel.id) if channel else ""
@@ -1071,7 +1119,7 @@ def register_commands(bot: Seele):
 
     @command("autoresume", "After a usage limit, prompt Claude again automatically when it resets")
     async def autoresume(interaction: discord.Interaction, on: bool = True):
-        if not await guard(interaction):
+        if not await guard(interaction, claude_only=True):
             return
         conv = conv_of(interaction)
         conv.autoresume = on

@@ -5,6 +5,7 @@ import json
 import stat
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -250,6 +251,56 @@ def test_prompt_then_resume(bot):
     assert "--input-format" in first["argv"]  # live input is the default
     assert second["argv"][second["argv"].index("--resume") + 1] == "sess-1"
     assert b.state.get(1).session_id == "sess-1"
+
+
+def test_codex_channel_queues_and_resumes(bot, tmp_path):
+    b, _ = bot
+    fake = tmp_path / "codex"
+    fake.write_text(f"#!{sys.executable}\n" + r'''
+import json, sys
+args = sys.argv[1:]
+prompt = sys.stdin.read()
+assert args[0] == "exec"
+assert args[args.index("--model") + 1] == "gpt-6.1-sol"
+assert 'model_reasoning_effort="xhigh"' in args
+assert args[-1] == "-"
+if prompt.endswith("again"):
+    assert args[1] == "resume" and args[-2] == "codex-session"
+else:
+    assert "resume" not in args
+for event in [
+    {"type": "thread.started", "thread_id": "codex-session"},
+    {"type": "item.completed", "item": {"type": "agent_message", "text": "Working on it"}},
+    {"type": "item.completed", "item": {"type": "agent_message", "text": prompt}},
+    {"type": "turn.completed"},
+]:
+    print(json.dumps(event), flush=True)
+''')
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    ch = Channel()
+    b.cfg.projects_root = tmp_path
+    b.cfg.codex = config.CodexConfig(binary=str(fake), channels={ch.id})
+    b.owners = {42}
+    author = SimpleNamespace(bot=False, id=42, display_name="Alice")
+    reactions = []
+
+    async def react(emoji):
+        reactions.append(emoji)
+
+    async def go():
+        for prompt in ("hello", "again"):
+            await b.on_message(SimpleNamespace(author=author, channel=ch, mentions=[], content=prompt,
+                                               attachments=[], add_reaction=react))
+        await until(lambda: not b.jobs)
+
+    asyncio.run(go())
+    assert reactions == ["📥"]
+    assert not ch.threads
+    assert [msg.content for msg in ch.live() if msg.content.startswith("[Discord")] == [
+        "[Discord message from Alice]\nhello", "[Discord message from Alice]\nagain",
+    ]
+    assert all("gpt-6.1-sol · effort xhigh" in msg.content for msg in ch.live()[::2])
+    assert config.State(b.state.path).get(ch.id).session_id == "codex-session"
 
 
 def test_plain_stdin_when_live_input_is_off(bot):
