@@ -4,6 +4,24 @@ All notable changes to this project are listed here ([Keep a Changelog](https://
 
 ## [Unreleased]
 
+- **Auto-resume after network outages and API server errors**, not only usage limits. One table
+  (`claude.TRANSIENT`) sorts failure texts into `limit`, `network` (`Can't reach the API server`,
+  `EAI_AGAIN`, `ENOTFOUND`, `ECONNRESET`, `ETIMEDOUT`, `ECONNREFUSED`, `Connection error`/`lost`,
+  `fetch failed`, `socket hang up`, `Request timed out`) and `server` (`server_error`, `overloaded`,
+  `api_error`, HTTP 500/502/503/504/529). A failed agent's task-notification, the lead's own error
+  result, or its process dying with such text (also in the middle of a later turn) puts the
+  conversation in a wait for the API, announced once ("⏸ network down: resuming when the API
+  answers"). SEELE then checks `api.anthropic.com` every 30 s (DNS + HTTPS HEAD, no auth); 30 s after
+  two good checks in a row the resume goes out with the stopped agents and the cause ("network outage
+  04:02–04:32"), as live input if the run is still going, else as a new prompt on the same session.
+  A resume that fails the same way within 15 minutes backs off 1, 2, 5, then 10 minutes, with no cap
+  while auto-resume is on; `/stop` and autoresume off cancel it. A pending limit resume and an outage
+  merge: the later time wins and a limit resume never fires while the API is unreachable (it probes
+  first and waits for the network instead). Agents still running when the lead's process dies on an
+  outage are listed too. `/status` shows the wait.
+- The resume is scheduled before anything is posted, and agent cards, status edits and notices
+  survive Discord being unreachable (connection errors, not only HTTP errors): in an outage
+  a failed post could swallow the schedule.
 - **Hosts: the bot on one machine, Claude on others.** `[hosts]` names machines reached over SSH;
   each conversation runs on one (`/host`, `seele conv --host`, `default_host` for new ones). A host
   with a `mac` is woken with Wake-on-LAN (re-sent every 30 s, up to `wake_timeout`) when it doesn't

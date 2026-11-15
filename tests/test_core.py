@@ -2,7 +2,9 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from seele import agents, claude, config, usage
+import pytest
+
+from seele import agents, claude, config, net, usage
 from seele.__main__ import app_id_from_token, invite_links
 from seele.text import duration, split_message
 
@@ -204,6 +206,66 @@ AGENT_LIMIT = ('Agent "SB1: Stubby look-dev r01" failed: Agent terminated early 
                "req_x, model sent to the API: claude-opus-5-5)")
 
 
+AGENT_NET = ('Agent "U2-UBD: ride/cove UI, size/stud UI, G7b" failed: Agent terminated early due to an API error: '
+             "API Error: Can't reach the API server \u2014 check your internet or DNS (EAI_AGAIN) (error type server_error)")
+
+
+@pytest.mark.parametrize("text, kind", [
+    # the 2026-11-15 outage, word for word: a failed agent, and the lead's own failed turn
+    (AGENT_NET, "network"),
+    ("API Error: Can't reach the API server \u2014 check your internet or DNS (EAI_AGAIN)", "network"),
+    ("Connection error.", "network"),
+    ("API Error: Connection lost mid-response. The response above may be incomplete.", "network"),
+    ("Error: getaddrinfo ENOTFOUND api.anthropic.com", "network"),
+    ("read ECONNRESET", "network"),
+    ("connect ETIMEDOUT 160.79.104.10:443", "network"),
+    ("connect ECONNREFUSED 127.0.0.1:443", "network"),
+    ("TypeError: fetch failed", "network"),
+    ("Error: socket hang up", "network"),
+    ("API Error: Request timed out.", "network"),
+    ("Agent terminated early due to an API error: Overloaded (error type overloaded_error, HTTP 529)", "server"),
+    ('API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}', "server"),
+    ('API Error: 500 {"type":"error","error":{"type":"api_error","message":"Internal server error"}}', "server"),
+    ("API Error: 502 Bad Gateway", "server"),
+    ("API Error: 503 Service Unavailable", "server"),
+    ("API Error: 504 Gateway Timeout", "server"),
+    ("Agent terminated early due to an API error (error type server_error)", "server"),
+    (AGENT_LIMIT, "limit"),
+    ("You've hit your limit · resets 7pm", "limit"),
+    # failures that don't pass by themselves
+    ("API Error: 400 Identity verification is required to continue.", ""),
+    ("API Error: 403 Attention Required! | Cloudflare", ""),
+    ('Agent "x" failed: Tool Bash failed: command exited with code 1', ""),
+    ('Background command "Start the game guard in the background" failed with exit code 144', ""),
+    ("Wrote 500 lines, 3 tests failed", ""),
+    ("", ""),
+])
+def test_transient_kind_table(text, kind):
+    assert claude.transient_kind(text) == kind
+
+
+def test_api_watch_needs_two_good_checks_in_a_row_then_settles():
+    import asyncio
+    answers = []
+
+    async def probe():
+        return answers.pop(0)
+    watch = net.ApiWatch(probe, settle=30)
+
+    async def go():
+        answers.extend([False, True, False, True, True, True])
+        assert not await watch.check(100)
+        assert await watch.check(130) and not watch.back_at  # one good check
+        assert not await watch.check(160)  # a bad one starts over
+        assert await watch.check(190) and await watch.check(220)
+        assert watch.back_at == 220 and watch.first_ok == 190
+        assert not watch.ready(240) and watch.ready(250)
+        watch.reset()  # a fresh failure somewhere: has to answer twice again
+        assert not watch.ready(1000)
+        assert await watch.check(1030) and not watch.back_at
+    asyncio.run(go())
+
+
 def test_looks_like_limit():
     assert claude.looks_like_limit("You've hit your limit · resets 7pm")
     assert claude.looks_like_limit("Claude usage limit reached.")
@@ -227,6 +289,12 @@ def test_reset_from_agent_limit_text():
     assert datetime.fromtimestamp(at, tz) == datetime(2026, 11, 14, 22, 10, tzinfo=tz)
     weekly = "You've hit your weekly limit · resets Nov 18, 5pm (Europe/Stockholm) (error type rate_limit, HTTP 429)"
     assert datetime.fromtimestamp(claude.reset_from_text(weekly, now), tz) == datetime(2026, 11, 18, 17, 0, tzinfo=tz)
+
+
+def test_stop_reason_kinds():
+    assert agents.stop_reason({"status": "failed", "summary": AGENT_NET}) == ("network", AGENT_NET)
+    assert agents.stop_reason({"status": "completed", "summary": AGENT_NET}) == ("", "")
+    assert agents.stop_reason({"status": "failed", "summary": "boom"}) == ("", "")
 
 
 def test_limit_stop_only_for_failed_agents():
@@ -369,26 +437,33 @@ def test_invite_links():
     assert "integration_type=1" in user
 
 
-def test_tracker_reports_limit_stopped_agents(tmp_path):
+def test_tracker_reports_agents_stopped_by_limits_and_outages(tmp_path):
     import asyncio
     seen = []
 
-    async def on_limit(card, text):
-        seen.append((card.task_id, card.description))
+    async def on_stop(card, text, kind):
+        seen.append((card.task_id, card.description, kind))
     board = agents.Board(config.State(tmp_path / "s.json"), resolve=None)
-    tracker = agents.Tracker(board, 1, config.Conversation(), on_limit=on_limit)
+    tracker = agents.Tracker(board, 1, config.Conversation(), on_stop=on_stop)
+
+    async def note(task_id, summary, status="failed"):
+        await tracker.handle(claude.Event("task_notification", data={"task_id": task_id, "status": status,
+                                                                      "summary": summary}))
 
     async def go():
-        await tracker.handle(claude.Event("task_started", data={"task_id": "a1", "task_type": "local_agent",
-                                                                 "description": "one"}))
-        await tracker.handle(claude.Event("task_notification", data={"task_id": "a1", "status": "failed",
-                                                                      "summary": AGENT_LIMIT}))
+        for tid in ("a1", "a3", "a4", "a5"):
+            await tracker.handle(claude.Event("task_started", data={"task_id": tid, "task_type": "local_agent",
+                                                                     "description": tid.replace("a", "agent ")}))
+        await note("a1", AGENT_LIMIT)
         # an agent this run never saw start, in the stream's own wording
-        await tracker.handle(claude.Event("task_notification", data={
-            "task_id": "a2", "status": "failed",
-            "summary": "Agent terminated early due to an API error: You've hit your weekly limit"}))
-        await tracker.handle(claude.Event("task_notification", data={
-            "task_id": "b1", "status": "failed", "summary": "Background command failed: hit your limit"}))
+        await note("a2", "Agent terminated early due to an API error: You've hit your weekly limit")
+        await note("b1", "Background command failed: hit your limit")  # not an agent
+        await note("a3", AGENT_NET)
+        await note("a4", "Agent terminated early due to an API error: Overloaded (error type overloaded_error, HTTP 529)")
+        await note("a5", 'Agent "agent 5" failed: Tool Bash failed: command exited with code 1')  # not transient
+        await note("a6", AGENT_NET)  # unseen, named in the summary
+        await note("a7", AGENT_NET, status="completed")  # finished fine: whatever its text says
     asyncio.run(go())
-    assert seen == [("a1", "one"), ("a2", "")]
+    assert seen == [("a1", "agent 1", "limit"), ("a2", "", "limit"), ("a3", "agent 3", "network"),
+                    ("a4", "agent 4", "server"), ("a6", "U2-UBD: ride/cove UI, size/stud UI, G7b", "network")]
     assert tracker.cards["a1"].status == "failed"

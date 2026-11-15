@@ -15,8 +15,9 @@ from seele.__main__ import write_request
 from seele.bot import Seele
 
 FAKE = r'''#!PYTHON
-import json, queue, sys, threading, time
+import json, os, queue, sys, threading, time
 argv = sys.argv[1:]
+DOWN = os.path.join(os.path.dirname(sys.argv[0]), "netdown")  # exists = every run dies on EAI_AGAIN
 live = "--input-format" in argv
 sid = argv[argv.index("--resume") + 1] if "--resume" in argv else "sess-1"
 if sid == "gone":
@@ -86,6 +87,11 @@ LIMIT_NOTE = ("Agent terminated early due to an API error: You've hit your 5-hou
               "(Europe/Stockholm) (error type rate_limit, HTTP 429, request id req_x, model sent to the API: "
               "claude-opus-5-5)")
 OTHER_NOTE = "Agent terminated early due to an API error: Overloaded (error type overloaded_error, HTTP 529)"
+# tonight's outage, word for word: an agent's task-notification and the lead's own failed turn
+NET_NOTE = ('Agent "U2-UBD: ride/cove UI, size/stud UI, G7b" failed: Agent terminated early due to an API error: '
+            "API Error: Can't reach the API server \u2014 check your internet or DNS (EAI_AGAIN) (error type server_error)")
+LEAD_NET = "API Error: Can't reach the API server \u2014 check your internet or DNS (EAI_AGAIN)"
+TOOL_NOTE = 'Agent "SB1: Stubby look-dev r01" failed: Tool Bash failed: command exited with code 1'
 
 def agent_limit_scenario(prompt):
     # agent ae46... is stopped by the 5-hour limit; the lead's own turn ends normally. With STAY a
@@ -102,7 +108,8 @@ def agent_limit_scenario(prompt):
         tasks=[{"task_id": tid, "task_type": "local_agent"} for _, tid, _ in agents])
     out(type="system", subtype="task_updated", task_id="ae4690131b5af3ed0", patch={"status": "failed"})
     out(type="system", subtype="task_notification", task_id="ae4690131b5af3ed0", status="failed",
-        summary=OTHER_NOTE if "OTHERFAIL" in prompt else LIMIT_NOTE)
+        summary=OTHER_NOTE if "OTHERFAIL" in prompt else NET_NOTE if "NETFAIL" in prompt
+        else TOOL_NOTE if "TOOLFAIL" in prompt else LIMIT_NOTE)
     out(type="system", subtype="background_tasks_changed",
         tasks=[{"task_id": tid, "task_type": "local_agent"} for _, tid, _ in agents[1:]])
     out(type="result", subtype="success", is_error=False, result="STARTED", session_id=sid)
@@ -118,9 +125,40 @@ def agent_limit_scenario(prompt):
     out(type="system", subtype="init", session_id=sid, model="fake", cwd=".")
     out(type="result", subtype="success", is_error=False, result="", session_id=sid)
 
+def lead_net_stay():
+    # the lead's own turn fails on the outage while a background agent keeps the process going
+    out(type="assistant", message={"content": [{"type": "tool_use", "id": "tu4", "name": "Agent",
+        "input": {"description": "long one", "prompt": "work", "run_in_background": True}}]})
+    out(type="system", subtype="task_started", task_id="a0000000000000004", tool_use_id="tu4",
+        description="long one", subagent_type="general-purpose", task_type="local_agent", prompt="work")
+    out(type="system", subtype="background_tasks_changed", tasks=[{"task_id": "a0000000000000004",
+                                                                   "task_type": "local_agent"}])
+    out(type="result", subtype="success", is_error=True, result=LEAD_NET, session_id=sid)
+    m = nxt(timeout=8)
+    if m:
+        note(m)
+        out(type="system", subtype="init", session_id=sid, model="fake", cwd=".")
+        out(type="result", subtype="success", is_error=False, result="got: " + m.splitlines()[-1], session_id=sid)
+    out(type="system", subtype="task_notification", task_id="a0000000000000004", status="completed", summary="ok")
+    out(type="system", subtype="background_tasks_changed", tasks=[])
+    out(type="system", subtype="init", session_id=sid, model="fake", cwd=".")
+    out(type="result", subtype="success", is_error=False, result="", session_id=sid)
+
 def turn(prompt):
     note(prompt)
     out(type="system", subtype="init", session_id=sid, model="fake", cwd=".")
+    if os.path.exists(DOWN) or "CRASHNET" in prompt:  # the process dies on the outage, no result
+        print("Error: getaddrinfo EAI_AGAIN api.anthropic.com", file=sys.stderr, flush=True)
+        os._exit(1)
+    if "LEADNET" in prompt and "STAY" not in prompt:  # the turn fails, then claude exits 1
+        out(type="result", subtype="success", is_error=True, result=LEAD_NET, session_id=sid)
+        os._exit(1)
+    if "LEADBAD" in prompt:  # a failure that doesn't pass by itself
+        out(type="result", subtype="success", is_error=True,
+            result="API Error: 400 Identity verification is required to continue.", session_id=sid)
+        return
+    if "LEADNET STAY" in prompt:
+        return lead_net_stay()
     out(type="assistant", message={"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]})
     out(type="rate_limit_event", rate_limit_info={"status": "allowed", "overageStatus": "rejected",
         "unifiedWindows": {"five_hour": {"utilization": 0.25, "status": "allowed"}}})
@@ -215,7 +253,19 @@ def bot(tmp_path):
     cfg.channels = {"agents": 500}
     b = Seele(cfg, config.State(tmp_path / "state.json"))
     b.requests_dir = tmp_path / "requests"
+    b.net.probe = Probe()  # never the real network in tests
     return b, fake
+
+
+class Probe:
+    """A fake API check: `up` says whether the API answers."""
+
+    def __init__(self, up=True):
+        self.up, self.calls = up, 0
+
+    async def __call__(self):
+        self.calls += 1
+        return self.up
 
 
 def calls(fake):
@@ -370,8 +420,7 @@ def test_limit_offers_other_account_and_schedules_autoresume(bot):
         await until(lambda: not b.jobs)
     asyncio.run(go())
     assert ch.sent[0].content.startswith("⚠️ **Failed**")
-    reply = ch.sent[1]
-    assert "hit your limit" in reply.content
+    reply = next(m for m in ch.sent if m.content and "hit your limit" in m.content)
     assert [i.label for i in reply.view.children] == ["Retry on two"]
     # the later of the two exhausted windows (5-hour and weekly), plus 5 minutes
     assert b.state.get(2).resume_at == 2000000000 + 300
@@ -492,7 +541,7 @@ def test_agent_limit_schedules_resume_and_names_the_agent_after_the_run_exits(bo
         expected = claude.reset_from_text("resets 10:10pm (Europe/Stockholm)") + botmod.RESUME_DELAY
         assert abs(conv.resume_at - expected) < 5 and not conv.resume_guessed
         assert conv.resume_agents == [{"id": STOPPED, "description": "SB1: Stubby look-dev r01",
-                                       "type": "general-purpose"}]
+                                       "type": "general-purpose", "cause": "limit"}]
         assert b.state.agents[STOPPED]["status"] == "failed"
         b.state = config.State(b.state.path)  # survives a restart: it's in the state file
         b.board.state = b.state
@@ -536,21 +585,29 @@ def test_agent_limit_resume_goes_into_the_running_session(bot):
     assert any(m.content.startswith("▶️") and "sent into the running session" in m.content for m in ch.sent)
 
 
-def test_agent_failure_without_a_limit_or_autoresume_schedules_nothing(bot):
-    b, _ = bot
+def test_failures_that_dont_pass_by_themselves_or_autoresume_off_schedule_nothing(bot):
+    b, fake = bot
     ch = Channel(1)
-    b.state.get(1).autoresume = True
+    for key in (1, 3):
+        b.state.get(key).autoresume = True
     b.state.get(2).autoresume = False
 
     async def go():
-        b.submit(1, ch, "AGENTLIMIT OTHERFAIL")  # failed, but not because of a limit
+        b.submit(1, ch, "AGENTLIMIT TOOLFAIL")  # an agent failed on a tool error: not transient
+        await until(lambda: not b.jobs)
+        b.submit(3, ch, "LEADBAD")  # the lead's own turn failed, but not on an outage or a limit
         await until(lambda: not b.jobs)
         b.submit(2, ch, "AGENTLIMIT go")  # a limit, but auto-resume is off
         await until(lambda: not b.jobs)
+        b.submit(2, ch, "LEADNET")  # an outage, but auto-resume is off
+        await until(lambda: not b.jobs)
+        assert await b.check_api() is None  # nobody waits for the API: no checks at all
     asyncio.run(go())
-    for key in (1, 2):
-        assert b.state.get(key).resume_at == 0 and b.state.get(key).resume_agents == []
+    for key in (1, 2, 3):
+        conv = b.state.get(key)
+        assert (conv.resume_at, conv.resume_agents, conv.resume_kinds) == (0, [], [])
     assert not any((m.content or "").startswith("⏸") for m in ch.sent)
+    assert b.net.probe.calls == 0 and len(calls(fake)) == 4
 
 
 def test_resume_dedupes_later_reset_wins_and_stop_drops_it(bot):
@@ -564,7 +621,7 @@ def test_resume_dedupes_later_reset_wins_and_stop_drops_it(bot):
 
     async def go():
         for tid in ("a1", "a2", "a1"):  # two agents at the same limit, one of them reported twice
-            await b.agent_limited(3, job, agents.Card(tid, description=f"job {tid}"), text, acc)
+            await b.agent_stopped(3, job, agents.Card(tid, description=f"job {tid}"), text, "limit", acc)
         first = conv.resume_at
         assert abs(first - claude.reset_from_text(text) - botmod.RESUME_DELAY) < 5
         # the lead's own limit at the same reset: already scheduled and announced
@@ -598,3 +655,206 @@ def test_human_prompt_cancelling_a_resume_carries_the_stopped_agents(bot):
     assert call["prompt"].startswith("carry on\n\n[SEELE note] Agents the limit stopped") and "- `a9`: nine" in call["prompt"]
     assert conv.resume_at == 0 and conv.resume_agents == []
     assert any("Auto-resume cancelled" in m.content and "1 stopped agent" in m.content for m in ch.sent)
+
+
+# ---------- auto-resume after a network outage or API server errors ----------
+OUTAGE_HEAD = "The API answers again after the network outage "
+
+
+async def api_back(b, checks=2):
+    """The API answers: `checks` good checks in a row (two = back)."""
+    b.net.probe.up = True
+    for _ in range(checks):
+        assert await b.check_api() is True
+
+
+def outage_conv(b, key, agents_channel=""):
+    conv = b.state.get(key)
+    conv.autoresume, conv.agents_channel = True, agents_channel
+    return conv
+
+
+def test_agent_network_failure_waits_for_the_api_then_resumes_with_the_list(bot):
+    b, fake = bot
+    ch, agents_ch = Channel(1), Channel(500)
+    b.get_channel = lambda cid: {1: ch, 500: agents_ch, **agents_ch.threads}.get(cid)
+    conv = outage_conv(b, 1, "500")
+    b.net.probe.up, b.net.settle = False, 0.3
+
+    async def go():
+        b.submit(1, ch, "AGENTLIMIT NETFAIL")  # the agent dies on EAI_AGAIN; the lead's turn ends, it exits
+        await until(lambda: not b.jobs)
+        assert conv.resume_kinds == ["network"] and conv.resume_at == 0
+        assert conv.resume_agents == [{"id": STOPPED, "description": "SB1: Stubby look-dev r01",
+                                       "type": "general-purpose", "cause": "network"}]
+        assert await b.check_api() is False  # still down
+        await b.check_resumes()
+        await api_back(b, checks=1)  # one good check isn't enough
+        await b.check_resumes()
+        assert len(calls(fake)) == 1
+        assert await b.check_api() is True  # two in a row: back, then API_SETTLE before resuming
+        await b.check_resumes()
+        assert len(calls(fake)) == 1 and conv.resume_kinds == ["network"]
+        await asyncio.sleep(0.35)
+        await b.check_resumes()
+        await until(lambda: not b.jobs and len(calls(fake)) == 2)
+    asyncio.run(go())
+    waiting = [m.content for m in ch.sent if m.content.startswith("⏸")]
+    assert waiting == ["⏸ network down: resuming when the API answers."]  # once
+    first, resumed = calls(fake)
+    assert resumed["argv"][resumed["argv"].index("--resume") + 1] == "sess-1"  # same conversation
+    assert resumed["prompt"].startswith(OUTAGE_HEAD) and "(SEELE auto-resume)" in resumed["prompt"]
+    assert "\n\nAgents the network outage " in resumed["prompt"] and resumed["prompt"].endswith(STOPPED_LINE)
+    resumed_note = [m.content for m in ch.sent if m.content.startswith("▶️")]
+    assert len(resumed_note) == 1 and resumed_note[0].startswith("▶️ " + OUTAGE_HEAD)
+    assert resumed_note[0].endswith(": resuming and picking up 1 stopped agent.")
+    assert (conv.resume_kinds, conv.resume_agents, conv.resume_sent) == ([], [], [])  # went through
+
+
+@pytest.mark.parametrize("how", ["CRASHNET", "LEADNET"])
+def test_lead_process_dying_on_eai_again_starts_a_new_prompt_after_reconnect(bot, how):
+    b, fake = bot
+    ch = Channel(1)
+    b.get_channel = lambda cid: ch if cid == 1 else None
+    conv = outage_conv(b, 1)
+    b.net.probe.up, b.net.settle = False, 0
+
+    async def go():
+        b.submit(1, ch, f"{how} work")  # no agents at all: the lead's own process fails and exits
+        await until(lambda: not b.jobs)
+        assert conv.resume_kinds == ["network"] and conv.resume_agents == []
+        await b.check_resumes()
+        assert len(calls(fake)) == 1
+        await api_back(b)
+        await b.check_resumes()
+        await until(lambda: not b.jobs and len(calls(fake)) == 2)
+    asyncio.run(go())
+    assert any("EAI_AGAIN" in (m.content or "") for m in ch.sent)  # its error was posted
+    assert [m.content for m in ch.sent if m.content.startswith("⏸")] == \
+        ["⏸ network down: resuming when the API answers."]
+    resumed = calls(fake)[1]
+    assert resumed["prompt"].startswith(OUTAGE_HEAD) and "Agents" not in resumed["prompt"]
+    assert resumed["argv"][resumed["argv"].index("--resume") + 1] == "sess-1"
+    assert any(m.content.startswith("▶️ " + OUTAGE_HEAD) and m.content.endswith(": resuming.") for m in ch.sent)
+    assert any(m.content.startswith("answer: " + OUTAGE_HEAD) for m in ch.sent)
+
+
+def test_reconnect_mid_turn_goes_in_as_live_input(bot):
+    b, fake = bot
+    ch = Channel(1)
+    b.get_channel = lambda cid: ch if cid == 1 else None
+    conv = outage_conv(b, 1)
+    b.net.probe.up, b.net.settle = False, 0
+
+    async def go():
+        b.submit(1, ch, "LEADNET STAY")  # its turn fails; a background agent keeps the process alive
+        await until(lambda: conv.resume_kinds == ["network"])
+        assert 1 in b.jobs
+        await api_back(b)
+        await b.check_resumes()
+        await until(lambda: not b.jobs)
+    asyncio.run(go())
+    prompts = [c["prompt"] for c in calls(fake)]
+    assert len(prompts) == 2 and prompts[1].startswith(OUTAGE_HEAD)  # one process: written into it
+    assert any(m.content.startswith("got: " + OUTAGE_HEAD) for m in ch.live())
+    assert any(m.content.startswith("▶️") and "(sent into the running session)" in m.content for m in ch.sent)
+
+
+def test_resume_that_fails_again_backs_off_and_keeps_trying(bot):
+    b, fake = bot
+    ch = Channel(1)
+    b.get_channel = lambda cid: ch if cid == 1 else None
+    conv = outage_conv(b, 1)
+    b.net.probe.up, b.net.settle = False, 0
+    b.backoff = (1.0, 2.0)
+    down = fake.parent / "netdown"
+
+    async def go():
+        b.submit(1, ch, "AGENTLIMIT NETFAIL")
+        await until(lambda: not b.jobs)
+        down.touch()  # the API check passes, but Claude's own requests still fail
+        await api_back(b)
+        await b.check_resumes()  # resume 1 goes out ...
+        await until(lambda: not b.jobs and len(calls(fake)) == 2)
+        # ... and dies on EAI_AGAIN again: retry 1 after the first backoff step, the agent still listed
+        assert conv.resume_tries == 1 and conv.resume_kinds == ["network"]
+        assert [a["id"] for a in conv.resume_agents] == [STOPPED]
+        assert conv.resume_at > time.time()
+        await api_back(b)
+        await b.check_resumes()
+        assert len(calls(fake)) == 2  # backing off
+        await asyncio.sleep(1.05)
+        await b.check_resumes()  # retry 1: fails again, next step
+        await until(lambda: not b.jobs and len(calls(fake)) == 3)
+        assert conv.resume_tries == 2 and conv.resume_at - time.time() > 1.2
+        await asyncio.sleep(2.05)
+        down.unlink()
+        await api_back(b)
+        await b.check_resumes()  # retry 2 goes through
+        await until(lambda: not b.jobs and len(calls(fake)) == 4)
+    asyncio.run(go())
+    prompts = [c["prompt"] for c in calls(fake)]
+    assert all(p.startswith(OUTAGE_HEAD) and p.endswith(STOPPED_LINE) for p in prompts[1:])
+    retries = [m.content for m in ch.sent if m.content.startswith("⏸ The auto-resume hit")]
+    assert retries == ["⏸ The auto-resume hit network down again: retry 1 in 1 s, once the API answers.",
+                       "⏸ The auto-resume hit network down again: retry 2 in 2 s, once the API answers."]
+    assert [m.content.endswith("(retry 2).") for m in ch.sent if m.content.startswith("▶️")] == [False, False, True]
+    assert any(m.content.startswith("answer: " + OUTAGE_HEAD) for m in ch.sent)
+    assert conv.resume_sent == [] and conv.resume_kinds == []
+
+
+def test_stop_cancels_a_wait_for_the_api(bot):
+    b, fake = bot
+    ch = Channel(1)
+    b.get_channel = lambda cid: ch if cid == 1 else None
+    conv = outage_conv(b, 1)
+    b.net.probe.up, b.net.settle = False, 0
+
+    async def go():
+        b.submit(1, ch, "AGENTLIMIT NETFAIL")
+        await until(lambda: not b.jobs)
+        assert conv.resume_kinds == ["network"] and conv.resume_agents
+        assert not b.stop(1)  # nothing runs, but the wait and its list are gone
+        assert (conv.resume_kinds, conv.resume_agents, conv.resume_tries) == ([], [], 0)
+        assert await b.check_api() is None
+        b.net.probe.up = True
+        await b.net.check()
+        await b.net.check()
+        await b.check_resumes()
+    asyncio.run(go())
+    assert len(calls(fake)) == 1
+
+
+def test_outage_and_limit_dedupe_and_a_limit_resume_waits_for_the_network(bot):
+    b, fake = bot
+    ch = Channel(1)
+    b.get_channel = lambda cid: ch if cid == 1 else None
+    conv = outage_conv(b, 1)
+    b.net.settle = 0
+
+    async def go():
+        # a limit resume is due, but the API doesn't answer: it waits for the network instead
+        conv.resume_at, conv.resume_kinds = time.time() - 1, ["limit"]
+        b.net.probe.up = False
+        await b.check_resumes()
+        assert conv.resume_kinds == ["limit", "network"] and not calls(fake)
+        await api_back(b)
+        conv.resume_at = time.time() + 3600  # a later limit time wins over the network coming back
+        await b.check_resumes()
+        assert not calls(fake)
+        # API server errors on an agent while waiting: same outage, no second announcement
+        await b.agent_stopped(1, botmod.Job(ch, "x", key=1), agents.Card("a7", description="seven"),
+                              "Agent terminated early due to an API error: Overloaded (error type "
+                              "overloaded_error, HTTP 529)", "server", b.cfg.accounts[0])
+        assert conv.resume_kinds == ["limit", "network", "server"]
+        assert not b.net.ready()  # a fresh failure: the API has to answer twice again
+        await api_back(b)
+        conv.resume_at = time.time() - 1
+        await b.check_resumes()
+        await until(lambda: not b.jobs and calls(fake))
+    asyncio.run(go())
+    assert [m.content for m in ch.sent if m.content.startswith("⏸")] == \
+        ["⏸ network down: resuming when the API answers."]
+    [call] = calls(fake)
+    assert call["prompt"].startswith("The usage limit has reset and the API answers again after the network outage ")
+    assert "Agents the limit and the network outage " in call["prompt"] and call["prompt"].endswith("- `a7`: seven")

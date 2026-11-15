@@ -17,11 +17,12 @@ from pathlib import Path
 import discord
 from discord import app_commands
 
-from . import agents, claude, config, usage
+from . import agents, claude, config, net, usage
 from .hosts import Host, HostError
 from .config import (SPEAKER_NOTE, Config, Conversation, State, apply_effort, default_effort, effort_in,
                      set_default_effort,
                      tag_prompt)
+from .agents import SEND_ERRORS
 from .text import code_safe, duration, short_path, split_message, thread_name
 
 log = logging.getLogger("seele")
@@ -31,6 +32,15 @@ AUTORESUME_PROMPT = ("The usage limit has reset (SEELE auto-resume). Continue: r
                      "limit stopped (SendMessage), then carry on.")
 RESUME_DELAY = 300  # seconds after the limit resets before the auto-resume prompt goes in
 RESUME_LISTED = 25  # stopped agents named in one auto-resume prompt
+# After a network outage or API server errors: check the API every API_EVERY seconds; after two good
+# checks in a row wait API_SETTLE more, then resume. A resume that fails the same way again (within
+# RETRY_WINDOW) waits RETRY_BACKOFF[n] on top, the last step repeating for as long as autoresume is on.
+API_EVERY = 30.0
+API_SETTLE = 30.0
+RETRY_BACKOFF = (60, 120, 300, 600)
+RETRY_WINDOW = 900
+WAITS_FOR_API = ("network", "server")
+DOWN_TEXT = {"network": "network down", "server": "API server errors"}
 POLL_EVERY = 3.0  # seconds between looks at the requests spool and scheduled resumes
 OFF = ("", "off", "none", "no", "0")
 
@@ -121,9 +131,29 @@ class SessionSelect(discord.ui.Select):
             content=f"Next message continues session `{self.values[0]}`.", view=None)
 
 
-def stopped_agents_note(stopped: list[dict]) -> str:
-    """The list of limit-stopped agents that goes with an auto-resume prompt."""
-    lines = ["Agents the limit stopped (SendMessage to each agent id):"]
+def hm(at: float) -> str:
+    return time.strftime("%H:%M", time.localtime(at))
+
+
+def outage_text(kinds, since: float = 0.0, back: float = 0.0) -> str:
+    """"the network outage 04:02–04:32" or "API server errors 04:05–04:07" ("" for a limit only)."""
+    span = f" {hm(since)}–{hm(back)}" if since and back else ""
+    if "network" in kinds:
+        return "the network outage" + span
+    if "server" in kinds:
+        return "API server errors" + span
+    return ""
+
+
+def cause_text(kinds, outage: str = "") -> str:
+    """What stopped the work: "the limit", the outage, or both."""
+    limit = "limit" in kinds or not outage
+    return " and ".join(filter(None, ["the limit" if limit else "", outage]))
+
+
+def stopped_agents_note(stopped: list[dict], kinds=(), outage: str = "") -> str:
+    """The list of stopped agents that goes with an auto-resume prompt."""
+    lines = [f"Agents {cause_text(kinds, outage)} stopped (SendMessage to each agent id):"]
     for agent in stopped[:RESUME_LISTED]:
         kind = f" ({agent['type']})" if agent.get("type") else ""
         lines.append(f"- `{agent.get('id')}`: {agents.clip(agent.get('description') or 'agent', 120)}{kind}")
@@ -132,13 +162,49 @@ def stopped_agents_note(stopped: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def resume_prompt(stopped: list[dict]) -> str:
-    return AUTORESUME_PROMPT + ("\n\n" + stopped_agents_note(stopped) if stopped else "")
+def resume_prompt(stopped: list[dict], kinds=(), outage: str = "") -> str:
+    if not outage:
+        head = AUTORESUME_PROMPT
+    else:
+        limit = "limit" in kinds
+        head = (("The usage limit has reset and the API" if limit else "The API") + f" answers again after {outage} "
+                f"(SEELE auto-resume). Continue: resume every agent {'they' if limit else 'it'} stopped "
+                "(SendMessage), then carry on.")
+    return head + ("\n\n" + stopped_agents_note(stopped, kinds, outage) if stopped else "")
 
 
-def clear_resume(conv: Conversation):
-    """Drop a scheduled auto-resume and its list of stopped agents."""
-    conv.resume_at, conv.resume_guessed, conv.resume_agents = 0, False, []
+def clear_resume(conv: Conversation, everything: bool = False):
+    """Drop a pending auto-resume and its list of stopped agents. `everything` also forgets the
+    retry count and what the last resume sent (/stop, autoresume off, a human prompt taking over)."""
+    conv.resume_at, conv.resume_guessed, conv.resume_agents, conv.resume_kinds = 0, False, [], []
+    if everything:
+        conv.resume_since, conv.resume_tries, conv.resume_last, conv.resume_sent = 0.0, 0, 0.0, []
+
+
+def resume_pending(conv: Conversation) -> bool:
+    return bool(conv.resume_at or conv.resume_agents or conv.resume_kinds)
+
+
+def waits_for_api(conv: Conversation) -> bool:
+    return any(k in WAITS_FOR_API for k in conv.resume_kinds)
+
+
+def remember_stopped(conv: Conversation, card: agents.Card, cause: str) -> bool:
+    """Put an agent on the next auto-resume's list (once). True if it was new."""
+    if any(a.get("id") == card.task_id for a in conv.resume_agents):
+        return False
+    conv.resume_agents.append({"id": card.task_id, "description": card.description,
+                               "type": card.subagent_type, "cause": cause})
+    return True
+
+
+def merged(*lists: list[dict]) -> list[dict]:
+    out, seen = [], set()
+    for agent in (a for items in lists for a in items):
+        if agent.get("id") not in seen:
+            seen.add(agent.get("id"))
+            out.append(agent)
+    return out
 
 
 def when_text(at: float, now: float | None = None) -> str:
@@ -162,6 +228,9 @@ class Seele(discord.Client):
         self.tasks: set[asyncio.Task] = set()
         self.board = agents.Board(state, self.channel_by_id)
         self.requests_dir = config.REQUESTS_DIR
+        self.net = net.ApiWatch(settle=API_SETTLE)  # is the API back after an outage?
+        self.api_every = API_EVERY
+        self.backoff = RETRY_BACKOFF
         register_commands(self)
 
     # ---------- setup ----------
@@ -172,6 +241,7 @@ class Seele(discord.Client):
             await self.tree.sync(guild=guild)
         await self.tree.sync()
         self.spawn(self.poll_forever())
+        self.spawn(self.watch_api_forever())
 
     async def on_ready(self):
         if not self.owners:
@@ -320,8 +390,8 @@ class Seele(discord.Client):
     def stop(self, key: int) -> bool:
         self.queue.pop(key, None)
         conv = self.state.convs.get(str(key))
-        if conv and (conv.resume_at or conv.resume_agents):
-            clear_resume(conv)
+        if conv and (resume_pending(conv) or conv.resume_tries or conv.resume_sent):
+            clear_resume(conv, everything=True)
             self.state.save()
         job = self.jobs.get(key)
         if job and job.run:
@@ -431,11 +501,12 @@ class Seele(discord.Client):
             if new_session:
                 conv.session_id = ""
                 self.state.save()
-            if human and (conv.resume_at or conv.resume_agents):
+            if human and resume_pending(conv):
                 stopped = [] if new_session else conv.resume_agents
                 if stopped:  # the lead still needs to know which agents to pick up again
-                    prompt += "\n\n[SEELE note] " + stopped_agents_note(stopped)
-                clear_resume(conv)
+                    outage = outage_text(conv.resume_kinds, conv.resume_since, self.net.first_ok)
+                    prompt += "\n\n[SEELE note] " + stopped_agents_note(stopped, conv.resume_kinds, outage)
+                clear_resume(conv, everything=True)
                 self.state.save()
                 n = len(stopped)
                 await channel.send("-# ⏸ Auto-resume cancelled: a new prompt started first"
@@ -447,7 +518,7 @@ class Seele(discord.Client):
             log.exception("job failed")
             try:
                 await channel.send(f"⚠️ Bot error: `{e}`")
-            except discord.HTTPException:
+            except SEND_ERRORS:
                 pass
         finally:
             self.jobs.pop(key, None)
@@ -493,8 +564,9 @@ class Seele(discord.Client):
             host.name if len(self.cfg.hosts) > 1 else "", host.short(cwd), account.name, model or "default model",
             f"effort {effort or await self.saved_effort(host) or 'default'}", mode,
             "🎮 guard on" if guard else ""]))
-        job.tracker = agents.Tracker(self.board, key, conv, getattr(channel, "jump_url", "") or "",
-                                     on_limit=lambda card, text: self.agent_limited(key, job, card, text, account))
+        job.tracker = agents.Tracker(
+            self.board, key, conv, getattr(channel, "jump_url", "") or "",
+            on_stop=lambda card, text, kind: self.agent_stopped(key, job, card, text, kind, account))
         self.jobs[key] = job
         ticker = None
         try:
@@ -513,6 +585,10 @@ class Seele(discord.Client):
                     except Exception:  # a Discord hiccup must not orphan the Claude process
                         log.exception("could not handle a %s event", ev.kind)
             ticker.cancel()
+            if conv.autoresume and waits_for_api(conv):  # agents still running died with the process
+                cause = next(k for k in conv.resume_kinds if k in WAITS_FOR_API)
+                if any([remember_stopped(conv, card, cause) for card in job.tracker.running()]):
+                    self.state.save()
             await job.tracker.close()
             self.state.save()
             if job.resume_failed and not job.results:
@@ -534,10 +610,12 @@ class Seele(discord.Client):
     async def on_event(self, key: int, job: Job, ev: claude.Event, account, retried: bool):
         conv = self.state.get(key)
         if ev.agent or ev.kind in claude.TASK_EVENTS:  # subagents: their cards, not the main status
-            if ev.kind == "task_started" and conv.resume_agents:  # picked up again before the auto-resume
-                left = [a for a in conv.resume_agents if a.get("id") != ev.data.get("task_id")]
-                if len(left) != len(conv.resume_agents):
-                    conv.resume_agents = left
+            if ev.kind == "task_started" and (conv.resume_agents or conv.resume_sent):  # picked up again
+                tid = ev.data.get("task_id")
+                left = [a for a in conv.resume_agents if a.get("id") != tid]
+                sent = [a for a in conv.resume_sent if a.get("id") != tid]
+                if len(left) + len(sent) != len(conv.resume_agents) + len(conv.resume_sent):
+                    conv.resume_agents, conv.resume_sent = left, sent
                     self.state.save()
             await job.tracker.handle(ev)
         elif ev.kind == "init":
@@ -573,15 +651,22 @@ class Seele(discord.Client):
         if job.results and not result.is_error and not result.text.strip():
             return  # an empty follow-up turn (e.g. after a background task ended): nothing to say
         job.results += 1
-        limit = result.is_error and claude.looks_like_limit(result.text)
+        conv = self.state.get(key)
+        kind = claude.transient_kind(result.text) if result.is_error else ""
+        # schedule before posting: in an outage the post fails too
+        if kind == "limit" and conv.autoresume:
+            await self.schedule_resume(key, job, result, account)
+        elif kind and conv.autoresume:  # the lead's own turn (or its process) failed on an outage
+            await self.plan_transient(key, job.channel, kind)
+        elif not result.is_error and conv.resume_sent:  # the last auto-resume went through
+            conv.resume_sent = []
+            self.state.save()
         view = None
-        if limit:
+        if kind == "limit":
             others = [a.name for a in self.cfg.accounts if a.name != account.name]
             if others:
                 view = RetryView(self, key, job.channel, others)
         await self.send_long(job.channel, result.text, view=view)
-        if limit and self.state.get(key).autoresume:
-            await self.schedule_resume(key, job, result, account)
         run = job.run
         if run and run.proc and run.proc.returncode is None and (run.input_open or run.tasks):
             await self.move_status(job)
@@ -592,7 +677,7 @@ class Seele(discord.Client):
         job.view = StopView(self, job.key)
         try:
             job.status = await job.channel.send(self.render(job), view=job.view)
-        except discord.HTTPException:
+        except SEND_ERRORS:
             job.view.stop()
             job.status, job.view = old, old_view
             return
@@ -600,7 +685,7 @@ class Seele(discord.Client):
             old_view.stop()
         try:
             await old.delete()
-        except (discord.HTTPException, AttributeError):
+        except (*SEND_ERRORS, AttributeError):
             pass
 
     async def tick(self, job: Job):
@@ -625,7 +710,7 @@ class Seele(discord.Client):
                 last = now
                 try:
                     await job.status.edit(content=self.render(job))
-                except discord.HTTPException:
+                except SEND_ERRORS:
                     pass
 
     def render(self, job: Job, head: str | None = None) -> str:
@@ -684,7 +769,7 @@ class Seele(discord.Client):
             head = f"✅ **Done** · {stats}"
         try:
             await job.status.edit(content=f"{head}\n-# {job.meta}", view=None)
-        except discord.HTTPException:
+        except SEND_ERRORS:
             pass
 
     async def send_long(self, channel, text: str, view=None):
@@ -697,22 +782,30 @@ class Seele(discord.Client):
         for i, piece in enumerate(pieces):
             await channel.send(piece, **(extra if i == len(pieces) - 1 else {}))
 
-    # ---------- auto-resume after a usage limit ----------
+    # ---------- auto-resume after a usage limit or an outage ----------
+    async def say(self, channel, text: str):
+        """Post a notice. In an outage Discord can be unreachable too: that must not stop anything."""
+        try:
+            await channel.send(text)
+        except Exception as e:
+            log.warning("could not post in %s: %s", getattr(channel, "id", "?"), e)
+
     async def schedule_resume(self, key: int, job: Job, result: claude.Event, account):
         """The run's own turn hit a usage limit."""
         reset = job.limit_reset or claude.reset_from_text(result.text) or await self.reset_from_usage(account)
         await self.plan_resume(key, job.channel, reset, "Usage limit hit")
 
-    async def agent_limited(self, key: int, job: Job, card: agents.Card, text: str, account):
-        """A background agent of this run was stopped by a usage limit (its task-notification
-        failed with the limit message). Remember it for the resume prompt and schedule the resume,
-        whether or not the run itself goes on."""
+    async def agent_stopped(self, key: int, job: Job, card: agents.Card, text: str, kind: str, account):
+        """A background agent of this run was stopped by a usage limit or an outage (its
+        task-notification failed with that message). Remember it for the resume prompt and plan the
+        resume, whether or not the run itself goes on."""
         conv = self.state.get(key)
         if not conv.autoresume:
             return
-        if all(a.get("id") != card.task_id for a in conv.resume_agents):
-            conv.resume_agents.append({"id": card.task_id, "description": card.description,
-                                       "type": card.subagent_type})
+        if kind in WAITS_FOR_API:
+            await self.plan_transient(key, job.channel, kind, card)
+            return
+        if remember_stopped(conv, card, kind):
             self.state.save()
         reset = claude.reset_from_text(text) or job.limit_reset or await self.reset_from_usage(account)
         await self.plan_resume(key, job.channel, reset, "Background agents hit the usage limit")
@@ -720,8 +813,12 @@ class Seele(discord.Client):
     async def plan_resume(self, key: int, channel, reset: float | None, why: str) -> bool:
         """Schedule the conversation's auto-resume at `reset` + RESUME_DELAY and say so once.
         With one already scheduled, the later reset wins (work goes on only once every limit has
-        reset) and a guess never replaces a known time. True if the schedule changed."""
+        reset) and a guess never replaces a known time; a wait for the API (outage) still applies on
+        top. True if the schedule changed."""
         conv = self.state.get(key)
+        if "limit" not in conv.resume_kinds:
+            conv.resume_kinds.append("limit")
+            self.state.save()
         guessed = reset is None
         now = time.time()
         at = max(reset or now + 3600, now) + RESUME_DELAY
@@ -731,10 +828,52 @@ class Seele(discord.Client):
         conv.resume_at, conv.resume_guessed = at, guessed
         self.state.save()
         note = " (couldn't read the reset time, so trying in an hour)" if guessed else ""
-        try:
-            await channel.send(f"⏸ {why}; resuming automatically at {when_text(at, now)}{note}.")
-        except discord.HTTPException as e:
-            log.warning("could not announce the auto-resume in %s: %s", key, e)
+        api = " once the API answers" if waits_for_api(conv) else ""
+        await self.say(channel, f"⏸ {why}; resuming automatically at {when_text(at, now)}{api}{note}.")
+        return True
+
+    async def plan_transient(self, key: int, channel, kind: str, card: agents.Card | None = None) -> bool:
+        """A network outage or API server errors ("network" / "server") stopped the lead's turn, its
+        process or one of its agents (`card`): resume once the API answers again (two good checks in
+        a row, then API_SETTLE). A failure soon after an auto-resume means that resume failed: it
+        backs off first (RETRY_BACKOFF, no cap). Announced once per outage. True if a wait started."""
+        conv = self.state.get(key)
+        if not conv.autoresume:
+            return False
+        now = time.time()
+        self.net.reset()  # the API has to answer again after this failure, whatever it did before
+        if card is not None:
+            remember_stopped(conv, card, kind)
+        if waits_for_api(conv):  # already waiting on this outage: nothing new to say
+            if kind not in conv.resume_kinds:
+                conv.resume_kinds.append(kind)
+            self.state.save()
+            return False
+        conv.resume_kinds.append(kind)
+        retry = bool(conv.resume_last) and now - conv.resume_last < RETRY_WINDOW
+        delay = 0
+        if retry:  # the last auto-resume ran into it again
+            conv.resume_tries += 1
+            delay = self.backoff[min(conv.resume_tries, len(self.backoff)) - 1]
+            conv.resume_at = max(conv.resume_at, now + delay)
+            conv.resume_agents = merged(conv.resume_sent, conv.resume_agents)
+            conv.resume_since = conv.resume_since or now
+        else:  # a new outage
+            conv.resume_tries, conv.resume_since = 0, now
+        conv.resume_sent = []
+        self.state.save()
+        log.info("conversation %s: %s, resuming when the API answers%s", key, DOWN_TEXT[kind],
+                 f" (retry {conv.resume_tries} in {delay:.0f} s)" if retry else "")
+        if retry:
+            wait = f"{delay // 60:.0f} min" if delay >= 60 else f"{delay:.0f} s"
+            text = (f"⏸ The auto-resume hit {DOWN_TEXT[kind]} again: retry {conv.resume_tries} in {wait}, "
+                    "once the API answers.")
+        else:
+            text = f"⏸ {DOWN_TEXT[kind]}: resuming when the API answers"
+            if conv.resume_at > now:
+                text += f", not before the limit resets ({when_text(conv.resume_at, now)})"
+            text += "."
+        await self.say(channel, text)
         return True
 
     async def reset_from_usage(self, account) -> float | None:
@@ -754,27 +893,59 @@ class Seele(discord.Client):
                     pass
         return max(resets) if resets else None
 
+    async def check_api(self) -> bool | None:
+        """One API check, only while some conversation waits for the API (None: nobody does)."""
+        if not any(waits_for_api(c) for c in self.state.convs.values()):
+            return None
+        return await self.net.check()
+
+    async def watch_api_forever(self):
+        while True:
+            await asyncio.sleep(self.api_every)
+            try:
+                await self.check_api()
+            except Exception:
+                log.exception("API check failed")
+
     async def check_resumes(self):
         now = time.time()
         for key_text, conv in list(self.state.convs.items()):
-            if not conv.resume_at or conv.resume_at > now:
+            if not (conv.resume_at or conv.resume_kinds) or conv.resume_at > now:
                 continue
-            prompt, n = resume_prompt(conv.resume_agents), len(conv.resume_agents)
-            clear_resume(conv)  # the list goes out with this prompt, once
-            self.state.save()
+            if waits_for_api(conv) and not self.net.ready(now):
+                continue  # still down, or not settled yet
             key = int(key_text)
-            channel = await self.channel_by_id(key)
+            try:
+                channel = await self.channel_by_id(key)
+            except Exception as e:  # Discord unreachable: keep the resume for the next look
+                log.warning("auto-resume: can't look up channel %s yet: %s", key, e)
+                continue
             if channel is None:
                 log.warning("auto-resume: channel %s is gone", key)
+                clear_resume(conv, everything=True)
+                self.state.save()
                 continue
-            # a run still going (mid-turn, or waiting on other agents) gets it as live input
+            if conv.autoresume and not waits_for_api(conv) and not await self.net.probe():
+                await self.plan_transient(key, channel, "network")  # a limit resume never goes into a dead network
+                continue
+            kinds, stopped, tries = list(conv.resume_kinds), list(conv.resume_agents), conv.resume_tries
+            outage = outage_text(kinds, conv.resume_since, self.net.first_ok or now)
+            prompt, n = resume_prompt(stopped, kinds, outage), len(stopped)
+            conv.resume_sent, conv.resume_last = stopped, now  # kept until a turn goes through (retries)
+            clear_resume(conv)  # the list goes out with this prompt, once
+            self.state.save()
+            # a run still going (mid-turn, or waiting on other agents) gets it as live input; a run that
+            # ended or died is started again on the same session
             where = await self.deliver(key, channel, prompt, human=False)
             agents_note = f" and picking up {n} stopped agent{'s' * (n != 1)}" if n else ""
             how = {"live": " (sent into the running session)", "queued": " (after the current run)"}.get(where, "")
-            try:
-                await channel.send(f"▶️ The usage limit has reset: resuming{agents_note}{how}.")
-            except discord.HTTPException:
-                pass
+            if not outage:
+                head = "The usage limit has reset"
+            else:
+                head = ("The usage limit has reset and the API" if "limit" in kinds else "The API") + \
+                    f" answers again after {outage}"
+            log.info("conversation %s: auto-resume (%s, %d agents, %s)", key, "+".join(kinds) or "limit", n, where)
+            await self.say(channel, f"▶️ {head}: resuming{agents_note}{how}" + (f" (retry {tries})" if tries else "") + ".")
 
     # ---------- requests from the `seele` CLI (conv / prompt) ----------
     async def poll_forever(self):
@@ -909,7 +1080,7 @@ class Seele(discord.Client):
         for name, value in new.items():
             setattr(conv, name, value)
         if new.get("autoresume") is False:
-            clear_resume(conv)
+            clear_resume(conv, everything=True)
         self.state.save()
         shown = ", ".join(f"{k}={v!r}" for k, v in new.items()) or "nothing changed"
         return f"conversation {key}: {shown}"
@@ -1176,8 +1347,11 @@ def register_commands(bot: Seele):
             lines.append(f"**Agent cards** <#{conv.agents_channel}>")
         if conv.autoresume:
             n = len(conv.resume_agents)
+            waiting = next((DOWN_TEXT[k] for k in conv.resume_kinds if k in WAITS_FOR_API), "")
             lines.append("**Auto-resume** on" + (f", next at {when_text(conv.resume_at)}" if conv.resume_at else "")
-                         + (f", picks up {n} stopped agent{'s' * (n != 1)}" if n else ""))
+                         + (f", waiting for the API ({waiting})" if waiting else "")
+                         + (f", picks up {n} stopped agent{'s' * (n != 1)}" if n else "")
+                         + (f", retry {conv.resume_tries}" if conv.resume_tries else ""))
         if job:
             queued = len(bot.queue.get(interaction.channel_id, []))
             running = len(job.tracker.running()) if job.tracker else 0
@@ -1190,7 +1364,7 @@ def register_commands(bot: Seele):
             lines.append(f"🎮 `{bot.cfg.guard_process}` is running on {host.name}: Claude is told to keep it light")
         await interaction.followup.send("\n".join(lines), ephemeral=True)
 
-    @command("stop", "Stop the running prompt here, drop queued messages and any scheduled auto-resume")
+    @command("stop", "Stop the running prompt here, drop queued messages and any pending auto-resume")
     async def stop(interaction: discord.Interaction):
         if not await guard(interaction):
             return
@@ -1278,18 +1452,18 @@ def register_commands(bot: Seele):
             f"🤖 Agent cards for this conversation go to {channel.mention}." if channel
             else "🤖 Agents show up in the live status here.")
 
-    @command("autoresume", "After a usage limit, prompt Claude again automatically when it resets")
+    @command("autoresume", "After a usage limit or an outage, prompt Claude again automatically once it's over")
     async def autoresume(interaction: discord.Interaction, on: bool = True):
         if not await guard(interaction):
             return
         conv = conv_of(interaction)
         conv.autoresume = on
         if not on:
-            clear_resume(conv)
+            clear_resume(conv, everything=True)
         bot.state.save()
         await interaction.response.send_message(
-            "⏸ Auto-resume on: after a usage limit, this conversation carries on when it resets." if on
-            else "Auto-resume off.")
+            "⏸ Auto-resume on: after a usage limit, a network outage or API errors, this conversation "
+            "carries on by itself once it's over." if on else "Auto-resume off.")
 
     @tree.error
     async def on_error(interaction: discord.Interaction, error: app_commands.AppCommandError):

@@ -177,13 +177,36 @@ def reset_from_text(text: str, now: float | None = None) -> float | None:
     return when.timestamp()
 
 
-# "You've hit your limit", "You've hit your 5-hour limit", "...weekly limit", "error type rate_limit", ...
-LIMIT_RE = re.compile(r"(usage|rate|session|weekly)[ _-]limit|hit your (?:[\w-]+ ){0,3}limit|limit reached"
-                      r"|out of (extra )?usage", re.I)
+# Failures that go away by themselves, by kind. Matched (case-insensitive) against failure texts only:
+# an error result, a crashed process's stderr, or a failed agent's task-notification. The first kind
+# that matches wins, so a limit message beats the server words around it, and "Can't reach the API
+# server ... (error type server_error)" is a network outage, not a server error.
+TRANSIENT = (
+    # "You've hit your limit", "...your 5-hour limit", "...weekly limit", "error type rate_limit", ...
+    ("limit", r"(?:usage|rate|session|weekly)[ _-]limit|hit your (?:[\w-]+ ){0,3}limit|limit reached"
+              r"|out of (?:extra )?usage"),
+    # "API Error: Can't reach the API server — check your internet or DNS (EAI_AGAIN)", "Connection error.",
+    # "Connection lost mid-response", "getaddrinfo ENOTFOUND api.anthropic.com", "fetch failed", ...
+    ("network", r"can.?t reach the api server|\bEAI_AGAIN\b|\bENOTFOUND\b|\bECONNRESET\b|\bETIMEDOUT\b"
+                r"|\bECONNREFUSED\b|connection (?:error|lost)|fetch failed|socket hang up|request timed out"),
+    # "Overloaded (error type overloaded_error, HTTP 529)", "API Error: 500 ... api_error", "error type server_error"
+    ("server", r"\bserver_error\b|overloaded|\bapi_error\b|internal server error|service unavailable|bad gateway"
+               r"|gateway time-?out|(?:api error|http|status)[: ]+(?:500|502|503|504|529)\b"),
+)
+TRANSIENT_RE = tuple((kind, re.compile(pattern, re.I)) for kind, pattern in TRANSIENT)
+LIMIT_RE = TRANSIENT_RE[0][1]
+
+
+def transient_kind(text: str) -> str:
+    """"limit", "network" or "server" for a failure that passes by itself, "" for anything else."""
+    for kind, pattern in TRANSIENT_RE:
+        if pattern.search(text or ""):
+            return kind
+    return ""
 
 
 def looks_like_limit(text: str) -> bool:
-    return bool(LIMIT_RE.search(text or ""))
+    return transient_kind(text) == "limit"
 
 
 class Run:
@@ -248,7 +271,8 @@ class Run:
             await err_task
         if self.stopped:
             yield Event("result", text="Stopped.", is_error=True, data={"subtype": "stopped"})
-        elif not got_result or code < 0 or code >= 128:  # no answer at all, or killed by a signal
+        elif not got_result or code < 0 or code >= 128 or (code and self.turn_active):
+            # no answer at all, killed by a signal, or died in the middle of a later turn
             tail = self.stderr.decode(errors="replace").strip()[-1500:]
             yield Event("result", text=tail or f"claude exited with code {code}", is_error=True,
                         data={"subtype": "crash"})

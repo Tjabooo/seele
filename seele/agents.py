@@ -11,12 +11,15 @@ import re
 import time
 from dataclasses import asdict, dataclass, field
 
+import aiohttp
 import discord
 
-from .claude import looks_like_limit
+from .claude import transient_kind
 from .text import duration, split_message
 
 log = logging.getLogger("seele.agents")
+# what a Discord post can raise: API errors, and plain connection errors while the network is down
+SEND_ERRORS = (discord.HTTPException, aiohttp.ClientError, OSError)
 
 # status -> (dot, label, embed colour)
 STATUS = {
@@ -44,12 +47,20 @@ def card_status(status: str | None) -> str:
     return "stopped"  # killed, stopped, cancelled, ...
 
 
+def stop_reason(d: dict) -> tuple[str, str]:
+    """(kind, error text) of a task_notification for an agent that a passing failure stopped: a usage
+    limit ("limit"), a network outage ("network") or API server errors ("server"); else ("", "")."""
+    if card_status(d.get("status")) not in ("failed", "stopped"):
+        return "", ""
+    text = " ".join(str(d.get(k) or "") for k in ("summary", "error", "note")).strip()
+    kind = transient_kind(text)
+    return (kind, text) if kind else ("", "")
+
+
 def limit_stop(d: dict) -> str:
     """The error text of a task_notification for an agent that a usage limit stopped, else ""."""
-    if card_status(d.get("status")) not in ("failed", "stopped"):
-        return ""
-    text = " ".join(str(d.get(k) or "") for k in ("summary", "error", "note")).strip()
-    return text if looks_like_limit(text) else ""
+    kind, text = stop_reason(d)
+    return text if kind == "limit" else ""
 
 
 def tokens(n: int) -> str:
@@ -175,7 +186,7 @@ class Board:
         extra = {"file": discord.File(io.BytesIO(file[1].encode()), file[0])} if file else {}
         try:
             await thread.send(content[:2000], **extra)
-        except discord.HTTPException as e:
+        except SEND_ERRORS as e:
             log.warning("agent thread %s: %s", card.thread_id, e)
 
     async def send_text(self, card: Card, text: str, filename: str):
@@ -196,7 +207,7 @@ class Board:
             return
         try:
             await msg.edit(embed=card_embed(card, time.time()))
-        except discord.HTTPException as e:
+        except SEND_ERRORS as e:
             log.warning("agent card %s: %s", card.message_id, e)
 
     async def flush(self, card: Card, force: bool = False):
@@ -237,9 +248,11 @@ class Board:
 class Tracker:
     """The agents of one running job. Feed it the run's task and subagent events."""
 
-    def __init__(self, board: Board, key: int, conv, jump: str = "", on_limit=None):
+    def __init__(self, board: Board, key: int, conv, jump: str = "", on_stop=None):
         self.board, self.key, self.conv, self.jump = board, key, conv, jump
-        self.on_limit = on_limit  # async (card, error text): an agent was stopped by a usage limit
+        # async (card, error text, kind): a usage limit, a network outage or API server errors stopped
+        # an agent (kind "limit", "network" or "server")
+        self.on_stop = on_stop
         self.cards: dict[str, Card] = {}
         self.by_tool: dict[str, str] = {}  # Agent tool_use id -> task id
 
@@ -302,7 +315,7 @@ class Tracker:
             return
         try:
             msg = await channel.send(embed=card_embed(card, time.time()))
-        except discord.HTTPException as e:
+        except SEND_ERRORS as e:
             log.warning("could not post an agent card in %s: %s", cid, e)
             return
         live = self.board.live.setdefault(card.task_id, Live())
@@ -312,7 +325,7 @@ class Tracker:
             thread = await msg.create_thread(name=clip(card.description or "agent", 95),
                                              auto_archive_duration=10080)
             card.thread_id, live.thread = thread.id, thread
-        except (discord.HTTPException, AttributeError) as e:
+        except (*SEND_ERRORS, AttributeError) as e:
             log.warning("could not open a thread on agent card %s: %s", msg.id, e)
         self.board.keep(card)
         await self._post_prompt(card, prompt)
@@ -374,14 +387,14 @@ class Tracker:
 
     async def _notification(self, d: dict):
         card = self._card(d)
-        limit = limit_stop(d)
+        kind, reason = stop_reason(d)
         if card is None:
             # an agent whose start this run never saw ("Agent terminated early due to an API error: ..."
             # or 'Agent "NAME" failed: ...'): still worth resuming
-            if limit and d.get("task_id") and re.search(r"\bAgent\b", limit):
-                named = re.search(r'Agent "([^"]+)"', limit)
-                await self._limited(Card(d["task_id"], conv=self.key, status="failed",
-                                         description=named.group(1) if named else ""), limit)
+            if kind and d.get("task_id") and re.search(r"\bAgent\b", reason):
+                named = re.search(r'Agent "([^"]+)"', reason)
+                await self._stopped(Card(d["task_id"], conv=self.key, status="failed",
+                                         description=named.group(1) if named else ""), reason, kind)
             return
         now = time.time()
         card.status = card_status(d.get("status"))
@@ -392,6 +405,8 @@ class Tracker:
         card.tokens = int(usage.get("total_tokens") or card.tokens)
         live = self.board.live.setdefault(card.task_id, Live())
         live.dirty = True
+        if kind:  # before the Discord posts: in an outage they fail too
+            await self._stopped(card, reason, kind)
         if card.channel_id:
             await self.board.flush(card, force=True)
             dot, label, _ = STATUS[card.status]
@@ -406,14 +421,12 @@ class Tracker:
                     await self.board.send_text(card, live.last_text, "last-message.md")
             self.board.keep(card)
         live.report = live.last_text = ""
-        if limit:
-            await self._limited(card, limit)
 
-    async def _limited(self, card: Card, text: str):
-        if self.on_limit is None:
+    async def _stopped(self, card: Card, text: str, kind: str):
+        if self.on_stop is None:
             return
         try:
-            await self.on_limit(card, text)
+            await self.on_stop(card, text, kind)
         except Exception:
             log.exception("could not schedule a resume for agent %s", card.task_id)
 

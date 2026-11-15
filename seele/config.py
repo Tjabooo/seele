@@ -217,12 +217,19 @@ class Conversation:
     listen: bool = False  # server channels: answer every message, not only mentions
     last_prompt: str = ""
     agents_channel: str = ""  # channel id for subagent cards; empty = list them in the status
-    autoresume: bool = False  # after a usage limit, prompt again when it resets
-    resume_at: float = 0.0  # epoch seconds of a scheduled auto-resume (0 = none)
+    autoresume: bool = False  # after a usage limit or an outage, prompt again once it has passed
+    resume_at: float = 0.0  # epoch seconds: the pending auto-resume goes out no earlier (0 = no time set)
     resume_guessed: bool = False  # resume_at is a guess (the reset time was unknown)
-    # background agents a usage limit stopped, named in the next auto-resume prompt:
-    # [{"id": agent/task id (what SendMessage takes), "description": ..., "type": subagent type}]
+    # background agents a limit or an outage stopped, named in the next auto-resume prompt:
+    # [{"id": agent/task id (what SendMessage takes), "description": ..., "type": subagent type,
+    #   "cause": "limit" | "network" | "server"}]
     resume_agents: list = field(default_factory=list)
+    # what the pending auto-resume waits for: "limit" (resume_at), "network"/"server" (the API answering)
+    resume_kinds: list = field(default_factory=list)
+    resume_since: float = 0.0  # when the current outage was first seen (for "network outage 04:02–04:32")
+    resume_tries: int = 0  # auto-resumes in a row that failed again on an outage (backoff)
+    resume_last: float = 0.0  # when the last auto-resume went out
+    resume_sent: list = field(default_factory=list)  # the agents it named, until a turn goes through
 
     def inherit(self) -> "Conversation":
         """Settings a new thread takes from its channel (no session)."""

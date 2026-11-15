@@ -41,7 +41,15 @@ seele ▸ ✅ Done · 1:07 · 9 tools · 5 h 13% · `3f2a91c0`
   on the limit (even while the run itself goes on, or after it has exited), the resume is scheduled
   and its prompt names every stopped agent by id, so Claude can continue each one with
   `SendMessage`. If the run is still going at the reset, the prompt goes into it as live input.
-  The schedule survives restarts.
+  Network outages and API server errors count too (`Can't reach the API server … (EAI_AGAIN)`,
+  `ECONNRESET`, `Overloaded`, 5xx, ...): when the lead's turn, its process or one of its agents
+  fails that way, SEELE says so once ("⏸ network down: resuming when the API answers"), checks the
+  API every 30 seconds (DNS + an unauthenticated HTTPS HEAD to `api.anthropic.com`) and, 30 seconds
+  after two good checks in a row, resumes with the stopped agents labelled by the outage ("network
+  outage 04:02–04:32"): as live input mid-run, or as a new prompt on the same session if the
+  process is gone. A resume that fails the same way again backs off 1, 2, 5, then every 10 minutes,
+  for as long as auto-resume is on; `/stop` cancels it. A limit resume never goes out while the API
+  is unreachable. The schedule survives restarts.
 - **Scriptable.** `seele post`, `seele thread`, `seele history`, `seele conv`, `seele prompt` and `seele usage` let
   Claude itself (or any script) post screenshots, open threads, change settings, hand over to a
   fresh session and pace itself against plan limits.
@@ -120,7 +128,7 @@ Just write to it. Everything else is slash commands:
 | `/sessions` | Pick a recent session in this folder to continue |
 | `/stop` | Stop the running prompt, drop queued messages and any scheduled auto-resume |
 | `/agents [channel]` | Post a live card per background agent in that channel (empty = list them in the status) |
-| `/autoresume on` | After a usage limit, carry on automatically when it resets |
+| `/autoresume on` | After a usage limit, a network outage or API errors, carry on automatically once it's over |
 | `/get path` | Upload a file from the machine |
 | `/listen on` | In a server channel: every message becomes a prompt (needs Message Content Intent) |
 
