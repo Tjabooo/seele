@@ -64,7 +64,7 @@ seele ▸ ✅ Done · 1:07 · 9 tools · 5 h 13% · `3f2a91c0`
 ## Install
 
 Needs Python 3.11+, a logged-in [Claude Code](https://docs.claude.com/en/docs/claude-code) CLI
-and systemd (any Linux desktop/server).
+and systemd (any Linux desktop/server), or Windows (see below).
 
 1. **Create the bot.** At <https://discord.com/developers/applications>: *New Application* →
    *Bot* → *Reset Token* and copy it. On the same page, turn on **Message Content Intent** (only
@@ -82,6 +82,25 @@ and systemd (any Linux desktop/server).
    anywhere). The bot DMs you when it first comes online.
 
 To keep it running while you're logged out: `loginctl enable-linger $USER`.
+
+### Bot on an always-on machine, Claude on others
+
+The bot can live on a machine that never sleeps (a home server, Windows or Linux) and run each
+conversation's prompts on another machine over SSH. A machine with a `mac` in `[hosts]` is woken
+with Wake-on-LAN when it doesn't answer, so a desktop can stay off until someone writes. `/host`
+picks the machine per conversation; folders, sessions, `/get`, attachments and the `[guard]`
+check all follow it. See `[hosts]` in `config.example.toml`.
+
+- **Windows bot:** `powershell -ExecutionPolicy Bypass -File install.ps1` (elevated): venv in
+  `~\.local\share\seele`, a scheduled task `SEELE` that starts at boot without a login and
+  restarts the bot, log in `~\.local\state\seele\seele.log`. It uses Windows' own OpenSSH.
+- **The machines that run Claude** need key login from the bot's machine, bash, python3 and a
+  logged-in `claude`. Runs take over that user's systemd session environment, so tools that talk
+  to the desktop (Wayland, D-Bus) work as they would from a local user service.
+- **Their CLI:** with `[bot] ssh = "server"` in a machine's config, `seele conv` / `seele prompt`
+  there hand their requests to the bot over SSH (`seele post` / `thread` talk to Discord directly
+  and work anywhere with the token). `install.sh` then installs only the CLI and leaves the
+  service off.
 
 ## Usage
 
@@ -214,6 +233,12 @@ Agent cards are tracked by task id in the state file, so an agent that is resume
 new run in the same session) keeps its card and thread. Discord limits are respected by batching:
 a card is edited at most every 10 s, and an agent's steps go to its thread in one message every
 ~12 s.
+
+On another machine the same command runs as `ssh HOST bash -c WRAPPER ...`: the wrapper imports
+`systemctl --user show-environment`, changes to the folder, prints its pid and `exec`s Claude Code,
+so Stop kills that process group over a second SSH connection. Folder checks, `/sessions`, `/cd`
+completion and `/usage` logins are small look-ups (`seele/hostops.py`, standard library only)
+piped into `python3 -` on that machine.
 
 `/usage` reads the account's OAuth token from `.credentials.json` and asks the same endpoint
 Claude Code's `/usage` uses; if the token has expired it runs `claude -p /usage` instead, which

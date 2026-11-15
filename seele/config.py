@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import tomllib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+from .hosts import Host
 
 CONFIG_PATH = Path(os.environ.get("SEELE_CONFIG", "~/.config/seele/config.toml")).expanduser()
 STATE_PATH = Path(os.environ.get("SEELE_STATE", "~/.local/state/seele/state.json")).expanduser()
@@ -41,6 +44,18 @@ class Account:
     config_dir: Path
     paths: list[Path] = field(default_factory=list)  # working dirs that pick this account
     effort: str = ""  # default effort for runs on this account
+    config_dir_raw: str = ""  # as written in the config (~ unexpanded): for other hosts
+    paths_raw: list[str] = field(default_factory=list)
+    usage_host: str = ""  # host whose login /usage reads (empty: here if logged in, else the default host)
+
+    def config_dir_on(self, host: Host) -> str:
+        return str(self.config_dir) if host.local else host.path(self.config_dir_raw or "~/.claude")
+
+    def is_default_dir(self, host: Host) -> bool:
+        """The host's own ~/.claude (then CLAUDE_CONFIG_DIR stays unset, which keeps ~/.claude.json)."""
+        if host.local:
+            return self.config_dir.resolve() == (Path.home() / ".claude").resolve()
+        return self.config_dir_on(host) == host.path("~/.claude")
 
 
 @dataclass
@@ -65,6 +80,20 @@ class Config:
     max_upload_mb: int = 10
     channels: dict[str, int] = field(default_factory=dict)  # names for `seele post --channel NAME`
     live_input: bool = True  # messages sent while Claude works go straight into the running turn
+    local_host: str = ""  # this machine's name among the hosts
+    default_host: str = ""  # where conversations run unless /host says otherwise
+    hosts: dict[str, Host] = field(default_factory=dict)
+    bot_ssh: str = ""  # [bot] ssh: the bot runs on that machine; seele conv/prompt hand requests to it
+    bot_command: str = "seele"  # [bot] command: the seele CLI there
+
+    def host(self, name: str = "") -> Host:
+        """A host by name ("" = the default host). Unknown names fall back to the default."""
+        if not self.hosts:
+            self.hosts[self.local_host or "local"] = Host(self.local_host or "local",
+                                                         default_cwd=str(self.default_cwd),
+                                                         projects_root=str(self.projects_root))
+        return (self.hosts.get(name) or self.hosts.get(self.default_host)
+                or self.hosts.get(self.local_host) or next(iter(self.hosts.values())))
 
     def name_for(self, uid: int, fallback: str) -> str:
         return self.people.get(uid) or fallback
@@ -79,12 +108,17 @@ class Config:
         known = ", ".join(sorted(self.channels)) or "none configured"
         raise ValueError(f"unknown channel {value!r} (names in [channels]: {known})")
 
-    def account_for(self, cwd: Path, override: str | None = None) -> Account:
+    def account_for(self, cwd, override: str | None = None, host: Host | None = None) -> Account:
         if override:
             for acc in self.accounts:
                 if acc.name == override:
                     return acc
-        cwd = cwd.resolve()
+        if host is not None and not host.local:
+            for acc in self.accounts:
+                if any(host.contains(host.path(p), str(cwd)) for p in acc.paths_raw):
+                    return acc
+            return self.accounts[0]
+        cwd = Path(cwd).resolve()
         for acc in self.accounts:
             for p in acc.paths:
                 if cwd == p or p in cwd.parents:
@@ -100,6 +134,15 @@ def account_env(cfg: "Config", account: Account) -> dict[str, str]:
     else:
         env["CLAUDE_CONFIG_DIR"] = str(account.config_dir)
     return env
+
+
+def host_env(cfg: "Config", account: Account, host: Host) -> tuple[dict[str, str], tuple[str, ...]]:
+    """(variables to set, variables to unset) for Claude Code runs on `account` on `host`."""
+    env = dict(cfg.env)
+    if account.is_default_dir(host):
+        return env, ("CLAUDE_CONFIG_DIR",)
+    env["CLAUDE_CONFIG_DIR"] = account.config_dir_on(host)
+    return env, ()
 
 
 def _path(value: str) -> Path:
@@ -130,10 +173,28 @@ def load(path: Path = CONFIG_PATH) -> Config:
     for name, acc in raw.get("accounts", {}).items():
         cfg.accounts.append(Account(name, _path(acc.get("config_dir", "~/.claude")),
                                     [_path(p).resolve() for p in acc.get("paths", [])],
-                                    acc.get("effort", "")))
+                                    acc.get("effort", ""), acc.get("config_dir", "~/.claude"),
+                                    [str(p) for p in acc.get("paths", [])], acc.get("usage_host", "")))
     if not cfg.accounts:
         default = os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")
         cfg.accounts.append(Account("claude", _path(default)))
+    cfg.local_host = str(raw.get("host_name") or socket.gethostname().split(".")[0].lower() or "local")
+    cfg.hosts[cfg.local_host] = Host(cfg.local_host, default_cwd=str(cfg.default_cwd),
+                                     projects_root=str(cfg.projects_root))
+    for name, h in raw.get("hosts", {}).items():
+        if name == cfg.local_host and not h.get("ssh"):
+            continue  # this machine: [claude] has its settings
+        cfg.hosts[name] = Host(name, ssh=h.get("ssh", ""), mac=h.get("mac", ""),
+                               broadcast=h.get("broadcast", "255.255.255.255"), home=h.get("home", ""),
+                               claude_bin=h.get("binary", ""), default_cwd=h.get("default_cwd", "~"),
+                               projects_root=h.get("projects_root", "~/Projects"),
+                               wake_timeout=float(h.get("wake_timeout", 240)), ssh_bin=h.get("ssh_binary", ""))
+    cfg.default_host = str(raw.get("default_host") or cfg.local_host)
+    if cfg.default_host not in cfg.hosts:
+        raise ValueError(f"default_host {cfg.default_host!r} is not in [hosts] (have: {', '.join(cfg.hosts)})")
+    b = raw.get("bot", {})
+    cfg.bot_ssh = b.get("ssh", "")
+    cfg.bot_command = b.get("command", cfg.bot_command)
     g = raw.get("guard", {})
     cfg.guard_process = g.get("process", "")
     cfg.guard_note = g.get("note", "")
@@ -145,6 +206,7 @@ class Conversation:
     """Settings for one DM, channel or thread. Empty strings mean "use the default"."""
     session_id: str = ""
     cwd: str = ""
+    host: str = ""  # which machine runs Claude ("" = the default host)
     account: str = ""
     model: str = ""
     effort: str = ""
@@ -161,7 +223,7 @@ class Conversation:
 
     def inherit(self) -> "Conversation":
         """Settings a new thread takes from its channel (no session)."""
-        return Conversation(cwd=self.cwd, account=self.account, model=self.model,
+        return Conversation(cwd=self.cwd, host=self.host, account=self.account, model=self.model,
                             effort=self.effort, mode=self.mode, agents_channel=self.agents_channel,
                             autoresume=self.autoresume)
 
@@ -198,18 +260,29 @@ class State:
         tmp.replace(self.path)
 
 
+def apply_effort(data: dict, level: str) -> list[str]:
+    """Set `level` as the default effort in a Claude Code settings dict. Returns the models changed."""
+    models = data.setdefault("modelSettings", {})
+    if not models:
+        data["effortLevel"] = level
+        return ["(all)"]
+    for name in models:
+        models[name]["effortLevel"] = level
+    return list(models)
+
+
+def effort_in(data: dict) -> str:
+    for val in (data.get("modelSettings") or {}).values():
+        if isinstance(val, dict) and val.get("effortLevel"):
+            return val["effortLevel"]
+    return data.get("effortLevel", "")
+
+
 def set_default_effort(settings_file: Path, level: str) -> list[str]:
     """Save `level` as Claude Code's default effort (what /effort does). Returns the models changed."""
     real = settings_file.resolve()  # the file may be a symlink into a synced folder
     data = json.loads(real.read_text()) if real.exists() else {}
-    models = data.setdefault("modelSettings", {})
-    if not models:
-        data["effortLevel"] = level
-        changed = ["(all)"]
-    else:
-        for name in models:
-            models[name]["effortLevel"] = level
-        changed = list(models)
+    changed = apply_effort(data, level)
     tmp = real.with_name(real.name + ".seele-tmp")
     tmp.write_text(json.dumps(data, indent=2) + "\n")
     tmp.replace(real)
@@ -221,7 +294,4 @@ def default_effort(settings_file: Path) -> str:
         data = json.loads(settings_file.read_text())
     except (OSError, json.JSONDecodeError):
         return ""
-    for val in (data.get("modelSettings") or {}).values():
-        if isinstance(val, dict) and val.get("effortLevel"):
-            return val["effortLevel"]
-    return data.get("effortLevel", "")
+    return effort_in(data)

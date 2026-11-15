@@ -34,6 +34,11 @@ if [ ! -f "$conf/config.toml" ]; then
 fi
 install -m 644 "$here/systemd/seele.service" "$unit/seele.service"
 systemctl --user daemon-reload
+bot_ssh="$("$data/venv/bin/python" -c 'from seele import config; print(config.load().bot_ssh)' 2>/dev/null || true)"
+if [ -n "$bot_ssh" ]; then  # [bot] ssh: the bot runs on that machine; this one only has the CLI
+  echo "Installed the CLI. The bot runs on $bot_ssh ([bot] ssh in $conf/config.toml), so the service stays off."
+  exit 0
+fi
 systemctl --user enable seele.service >/dev/null
 if [ "$restart" = 0 ]; then
   echo "Installed; the running service was left alone. Restart it once no prompt runs: seele-restart-later"

@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from .hostops import _clip, project_dir, recent_sessions, session_title  # noqa: F401 (re-exported)
+
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 MODES = ("auto", "acceptEdits", "plan", "bypassPermissions")
 
@@ -59,11 +61,6 @@ def build_argv(binary: str, *, session_id: str | None = None, model: str | None 
 def _home(path: str) -> str:
     home = str(Path.home())
     return "~" + path[len(home):] if path.startswith(home) else path
-
-
-def _clip(text: str, n: int = 90) -> str:
-    text = " ".join(str(text).split())
-    return text if len(text) <= n else text[: n - 1] + "…"
 
 
 def tool_summary(name: str, args: dict) -> str:
@@ -199,10 +196,15 @@ class Run:
     is left and nothing was written since; then Claude Code exits on its own.
     """
 
-    def __init__(self, argv: list[str], prompt: str, cwd: Path, env: dict[str, str], *,
-                 live: bool = False, idle_grace: float = 20.0):
+    def __init__(self, argv: list[str], prompt: str, cwd: Path | None, env: dict[str, str], *,
+                 live: bool = False, idle_grace: float = 20.0, remote_stop=None):
         self.argv, self.prompt, self.cwd, self.env = argv, prompt, cwd, env
         self.live, self.idle_grace = live, idle_grace
+        # For a run on another machine (argv is ssh): called with the remote process id that the
+        # wrapper reports on stderr ("SEELE_PID 1234"), to stop it there too.
+        self.remote_stop = remote_stop
+        self.remote_pid = 0
+        self._bg: set = set()
         self.proc: asyncio.subprocess.Process | None = None
         self.stopped = False
         self.stderr = b""
@@ -215,7 +217,7 @@ class Run:
 
     async def events(self):
         self.proc = await asyncio.create_subprocess_exec(
-            *self.argv, cwd=str(self.cwd), env=self.env,
+            *self.argv, cwd=str(self.cwd) if self.cwd else None, env=self.env,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, start_new_session=True, limit=64 * 1024 * 1024)
         try:
@@ -312,52 +314,34 @@ class Run:
 
     async def _drain_stderr(self):
         while chunk := await self.proc.stderr.read(65536):
+            if not self.remote_pid and b"SEELE_PID " in chunk:
+                head, _, rest = chunk.partition(b"SEELE_PID ")
+                pid, _, rest = rest.partition(b"\n")
+                self.remote_pid = int(pid) if pid.strip().isdigit() else 0
+                chunk = head + rest
+                if self.stopped:  # stopped before the remote side said who it is
+                    self._stop_remote()
             self.stderr = (self.stderr + chunk)[-8192:]
+
+    def _stop_remote(self):
+        if self.remote_stop and self.remote_pid:
+            pid, self.remote_pid = self.remote_pid, 0
+            try:
+                task = asyncio.get_running_loop().create_task(self.remote_stop(pid))
+                self._bg.add(task)
+                task.add_done_callback(self._bg.discard)
+            except RuntimeError:
+                pass
 
     def stop(self):
         self.stopped = True
         self.close_input()
+        self._stop_remote()
         if self.proc and self.proc.returncode is None:
             try:
-                os.killpg(self.proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
+                if hasattr(os, "killpg"):
+                    os.killpg(self.proc.pid, signal.SIGTERM)
+                else:  # Windows: no process groups to signal
+                    self.proc.terminate()
+            except (ProcessLookupError, PermissionError):
                 pass
-
-
-def project_dir(config_dir: Path, cwd: Path) -> Path:
-    """Where Claude Code keeps the transcripts for a working directory."""
-    return config_dir / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
-
-
-def recent_sessions(config_dir: Path, cwd: Path, limit: int = 15) -> list[tuple[str, str, float]]:
-    """(session id, title, mtime) for the newest transcripts of `cwd`."""
-    folder = project_dir(config_dir, cwd)
-    files = sorted(folder.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
-    return [(f.stem, session_title(f), f.stat().st_mtime) for f in files]
-
-
-def session_title(path: Path) -> str:
-    title, first = "", ""
-    try:
-        with path.open(encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                if '"ai-title"' in line:
-                    try:
-                        title = json.loads(line).get("aiTitle") or title
-                    except json.JSONDecodeError:
-                        pass
-                elif not first and '"user"' in line:
-                    try:
-                        d = json.loads(line)
-                        if d.get("type") != "user" or d.get("isMeta"):
-                            continue
-                        content = d["message"]["content"]
-                    except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
-                        continue
-                    if isinstance(content, list):
-                        content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
-                    if isinstance(content, str) and content.strip() and not content.lstrip().startswith("<"):
-                        first = content
-    except OSError:
-        pass
-    return _clip(title or first or "(untitled)", 90)

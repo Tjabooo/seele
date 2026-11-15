@@ -10,7 +10,7 @@
   seele history (--channel NAME_OR_ID | --server GUILD_ID) [--limit N] [--bots] [--json]
                     print a channel's messages (or every channel and thread in a server),
                     oldest first; --limit counts per channel, bots are left out unless --bots
-  seele conv --id ID [--cwd P] [--account A] [--effort E] [--model M] [--mode M] [--session SID|new]
+  seele conv --id ID [--host H] [--cwd P] [--account A] [--effort E] [--model M] [--mode M] [--session SID|new]
              [--agents-channel ID|off] [--autoresume on|off] [--listen on|off]
                     change a conversation's settings (the running bot applies them)
   seele prompt --id ID [--new-session] (--text T | --file F) [--as NAME]
@@ -20,6 +20,7 @@
 
 Channel names come from [channels] in the config. `conv` and `prompt` go through the requests
 folder next to the state file; they wait (--wait seconds, default 15) for the bot's answer.
+With [bot] ssh in the config (the bot runs on another machine), they go to that machine over SSH.
 """
 from __future__ import annotations
 
@@ -97,7 +98,43 @@ def wait_answer(path: Path, timeout: float) -> dict | None:
     return None
 
 
-def submit(data: dict, wait: float) -> int:
+def relay(cfg: config.Config, data: dict, wait: float) -> int:
+    """Hand a request to the bot on another machine ([bot] ssh): `seele enqueue` there."""
+    import subprocess
+
+    from .hosts import default_ssh
+    argv = [default_ssh(), "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", cfg.bot_ssh,
+            f"{cfg.bot_command} enqueue --wait {max(0.0, wait):g}"]
+    try:
+        done = subprocess.run(argv, input=json.dumps(data).encode(), capture_output=True, timeout=wait + 60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"seele: couldn't reach the bot on {cfg.bot_ssh}: {e}", file=sys.stderr)
+        return 1
+    try:
+        answer = json.loads(done.stdout.decode(errors="replace").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        err = (done.stderr or done.stdout).decode(errors="replace").strip()[-500:]
+        print(f"seele: no answer from the bot on {cfg.bot_ssh}: {err or 'exit ' + str(done.returncode)}",
+              file=sys.stderr)
+        return 1
+    return show_answer(answer, answer.get("queued", ""), wait)
+
+
+def show_answer(answer: dict | None, name: str, wait: float) -> int:
+    if answer is None or "queued" in answer:
+        if wait <= 0:
+            print(f"queued {name}")
+        else:
+            print(f"queued {name}, but SEELE didn't pick it up within {wait:g} s (is the bot running?). "
+                  "It applies when the bot next looks.", file=sys.stderr)
+        return 0
+    print(answer.get("message", ""), file=sys.stdout if answer.get("ok") else sys.stderr)
+    return 0 if answer.get("ok") else 1
+
+
+def submit(data: dict, wait: float, cfg: config.Config | None = None) -> int:
+    if cfg is not None and cfg.bot_ssh:
+        return relay(cfg, data, wait)
     path = write_request(data)
     if wait <= 0:
         print(f"queued {path.name}")
@@ -118,6 +155,8 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("run", help="run the bot")
     sub.add_parser("invite", help="print the links that add the bot")
     sub.add_parser("check", help="check the config and the claude binary")
+    p = sub.add_parser("enqueue", help=argparse.SUPPRESS)  # a conv/prompt request on stdin (used over SSH)
+    p.add_argument("--wait", type=float, default=15)
 
     p = sub.add_parser("post", help="post a message (and files) as the bot")
     p.add_argument("--channel", required=True, help="channel or thread id, or a name from [channels]")
@@ -140,7 +179,8 @@ def parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("conv", help="change a conversation's settings")
     p.add_argument("--id", required=True, help="thread / channel / DM id, or a name from [channels]")
-    p.add_argument("--cwd", help="working folder (a project name, ~/path or /path)")
+    p.add_argument("--host", help="machine that runs Claude (a name from [hosts]), or default")
+    p.add_argument("--cwd", help="working folder on that machine (a project name, ~/path or /path)")
     p.add_argument("--account", help="account name from the config, or auto")
     p.add_argument("--effort", choices=(*claude.EFFORTS, "default"))
     p.add_argument("--model", help="model id or alias, or default")
@@ -237,6 +277,17 @@ def main(argv: list[str]) -> int:
     if cmd == "usage":
         return usage_report(cfg, args.account, args.json)
 
+    if cmd == "enqueue":
+        try:
+            data = json.loads(sys.stdin.read())
+        except ValueError as e:
+            print(json.dumps({"ok": False, "message": f"bad request: {e}"}))
+            return 1
+        path = write_request(data)
+        answer = wait_answer(path, args.wait) if args.wait > 0 else None
+        print(json.dumps(answer if answer is not None else {"queued": path.name}))
+        return 0
+
     if cmd in ("conv", "prompt"):
         try:
             cid = cfg.channel_id(args.id)
@@ -245,7 +296,7 @@ def main(argv: list[str]) -> int:
             return 2
         if cmd == "conv":
             changes = {k: v for k, v in {
-                "cwd": args.cwd, "account": args.account, "effort": args.effort, "model": args.model,
+                "host": args.host, "cwd": args.cwd, "account": args.account, "effort": args.effort, "model": args.model,
                 "mode": args.mode, "session": args.session, "agents_channel": args.agents_channel,
                 "autoresume": args.autoresume, "listen": args.listen}.items() if v is not None}
             if not changes:
@@ -257,7 +308,7 @@ def main(argv: list[str]) -> int:
                 except ValueError as e:
                     print(f"seele: {e}", file=sys.stderr)
                     return 2
-            return submit({"kind": "conv", "id": cid, "set": changes}, args.wait)
+            return submit({"kind": "conv", "id": cid, "set": changes}, args.wait, cfg)
         if args.text is not None:
             text = args.text
         elif args.file == "-":
@@ -272,7 +323,7 @@ def main(argv: list[str]) -> int:
             print("seele prompt: the prompt is empty", file=sys.stderr)
             return 2
         return submit({"kind": "prompt", "id": cid, "text": text, "new_session": args.new_session,
-                       "as": args.speaker or ""}, args.wait)
+                       "as": args.speaker or ""}, args.wait, cfg)
 
     if not cfg.token:
         print(f"No Discord bot token. Put token = \"...\" in {config.CONFIG_PATH} "
@@ -300,6 +351,7 @@ def main(argv: list[str]) -> int:
         print(f"Add to a server:\n  {server}\n\nAdd to your account (DMs and commands anywhere):\n  {user}")
         return 0
     if cmd == "check":
+        import asyncio
         ok = True
         binary = shutil.which(cfg.claude_bin)
         print(f"claude binary: {binary or 'NOT FOUND'}")
@@ -309,6 +361,15 @@ def main(argv: list[str]) -> int:
             print(f"account {acc.name}: {acc.config_dir} ({'logged in' if creds else 'no .credentials.json'})")
         print(f"default folder: {cfg.default_cwd} ({'ok' if cfg.default_cwd.is_dir() else 'MISSING'})")
         print(f"projects root: {cfg.projects_root}")
+        for host in cfg.hosts.values():
+            if host.local:
+                print(f"host {host.name}: this machine{' (default)' if host.name == cfg.default_host else ''}")
+                continue
+            reach = asyncio.run(host.reachable())
+            print(f"host {host.name}: ssh {host.ssh}{', Wake-on-LAN ' + host.mac if host.mac else ''}"
+                  f"{' (default)' if host.name == cfg.default_host else ''}: {'answers' if reach else 'NOT ANSWERING'}")
+        if cfg.bot_ssh:
+            print(f"bot: runs on {cfg.bot_ssh} (seele conv/prompt go there)")
         print(f"owners: {sorted(cfg.owners) or 'the application owner'}")
         print(f"channels: {', '.join(f'{k}={v}' for k, v in cfg.channels.items()) or 'none named'}")
         print(f"application id: {app_id_from_token(cfg.token)}")
@@ -317,7 +378,15 @@ def main(argv: list[str]) -> int:
     import discord
 
     from .bot import Seele
-    discord.utils.setup_logging(level=logging.INFO)
+    log_file = os.environ.get("SEELE_LOG_FILE")
+    if log_file:  # e.g. a Windows scheduled task, where nothing reads stderr
+        from logging.handlers import RotatingFileHandler
+        Path(log_file).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        discord.utils.setup_logging(handler=RotatingFileHandler(Path(log_file).expanduser(), maxBytes=5_000_000,
+                                                                backupCount=3, encoding="utf-8"),
+                                    level=logging.INFO)
+    else:
+        discord.utils.setup_logging(level=logging.INFO)
     for content in (True, False):
         bot = Seele(cfg, config.State(), message_content=content)
         try:

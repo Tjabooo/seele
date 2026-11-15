@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+import posixpath
 import shlex
 import shutil
 import time
@@ -17,7 +18,9 @@ import discord
 from discord import app_commands
 
 from . import agents, claude, config, usage
-from .config import (SPEAKER_NOTE, Config, Conversation, State, default_effort, set_default_effort,
+from .hosts import Host, HostError
+from .config import (SPEAKER_NOTE, Config, Conversation, State, apply_effort, default_effort, effort_in,
+                     set_default_effort,
                      tag_prompt)
 from .text import code_safe, duration, short_path, split_message, thread_name
 
@@ -256,7 +259,7 @@ class Seele(discord.Client):
             except discord.HTTPException:
                 key = channel.id
 
-        prompt = await self.with_attachments(msg, content)
+        prompt = await self.with_attachments(msg, content, key)
         if not prompt.strip():
             return
         name = self.cfg.name_for(msg.author.id, msg.author.display_name)
@@ -264,17 +267,29 @@ class Seele(discord.Client):
         if where != "started":
             await msg.add_reaction("📨" if where == "live" else "📥")
 
-    async def with_attachments(self, msg: discord.Message, prompt: str) -> str:
+    async def with_attachments(self, msg: discord.Message, prompt: str, key: int = 0) -> str:
         if not msg.attachments:
             return prompt
         folder = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "seele" / "attachments"
         folder.mkdir(parents=True, exist_ok=True)
-        lines = []
+        host = self.cfg.host(self.state.get(key).host) if key else self.cfg.host()
+        lines, problem = [], ""
         for att in msg.attachments:
-            path = folder / f"{msg.id}-{Path(att.filename).name}"
+            name = f"{msg.id}-{Path(att.filename).name}"
+            path = folder / name
             await att.save(path)
-            lines.append(f"- {path} ({att.content_type or 'file'}, {att.size // 1024} KB)")
-        return (prompt or "See the attached files.") + "\n\nAttached files (saved on this machine):\n" + "\n".join(lines)
+            where = str(path)
+            if not host.local and not problem:
+                try:  # Claude runs on another machine: the file goes there too (waking it if needed)
+                    await host.ensure_up()
+                    where = posixpath.join(host.path("~/.cache/seele/attachments"), name)
+                    await host.put(path.read_bytes(), where)
+                except (HostError, OSError) as e:
+                    problem, where = str(e), str(path)
+            lines.append(f"- {where} ({att.content_type or 'file'}, {att.size // 1024} KB)")
+        note = f" (couldn't copy them to {host.name}: {problem}; these paths are on the bot's machine)" if problem else ""
+        return ((prompt or "See the attached files.") + f"\n\nAttached files (saved on this machine){note}:\n"
+                + "\n".join(lines))
 
     async def deliver(self, key: int, channel, prompt: str, human: bool = True) -> str:
         """A message for a conversation: start a job, write it into the running Claude process
@@ -315,9 +330,14 @@ class Seele(discord.Client):
         return False
 
     # ---------- running Claude ----------
+    def host_of(self, conv: Conversation) -> Host:
+        return self.cfg.host(conv.host)
+
     def settings_for(self, conv: Conversation):
-        cwd = Path(conv.cwd or self.cfg.default_cwd)
-        account = self.cfg.account_for(cwd, conv.account or None)
+        """(cwd, account, model, effort, mode); cwd is a path on the conversation's host."""
+        host = self.host_of(conv)
+        cwd = host.path(conv.cwd or host.default_cwd)
+        account = self.cfg.account_for(cwd, conv.account or None, host)
         model = conv.model or self.cfg.model
         effort = conv.effort or account.effort or self.cfg.effort
         mode = conv.mode or self.cfg.permission_mode
@@ -326,12 +346,84 @@ class Seele(discord.Client):
     def child_env(self, account) -> dict[str, str]:
         return config.account_env(self.cfg, account)
 
-    async def guard_active(self) -> bool:
+    async def guard_active(self, host: Host | None = None) -> bool:
+        """Is the guard process (a game, say) running on the host?"""
         if not self.cfg.guard_process:
             return False
-        proc = await asyncio.create_subprocess_exec("pgrep", "-x", self.cfg.guard_process,
-                                                    stdout=asyncio.subprocess.DEVNULL)
-        return await proc.wait() == 0
+        host = host or self.cfg.host()
+        try:
+            return bool(await host.op("pgrep", self.cfg.guard_process, timeout=10))
+        except (HostError, OSError):
+            return False
+
+    def settings_path(self, host: Host) -> str:
+        return str(self.cfg.settings_file) if host.local else host.path("~/.claude/settings.json")
+
+    async def saved_effort(self, host: Host) -> str:
+        """Claude Code's default effort on the host (its settings.json)."""
+        if host.local:
+            return default_effort(self.cfg.settings_file)
+        try:
+            return effort_in(json.loads(await host.op("read", self.settings_path(host), timeout=10) or "{}"))
+        except (HostError, OSError, ValueError):
+            return ""
+
+    async def save_effort(self, host: Host, level: str) -> list[str]:
+        if host.local:
+            return set_default_effort(self.cfg.settings_file, level)
+        await host.ensure_up()
+        path = self.settings_path(host)
+        real = await host.op("realpath", path)  # the file may be a symlink into a synced folder
+        data = json.loads(await host.op("read", real) or "{}")
+        changed = apply_effort(data, level)
+        await host.put((json.dumps(data, indent=2) + "\n").encode(), real + ".seele-tmp")
+        await host.op("rename", real + ".seele-tmp", real)
+        return changed
+
+    def usage_host(self, account) -> Host:
+        """Where an account's login is read for /usage: its `usage_host`, else here if it's logged in
+        here, else the default host."""
+        if account.usage_host:
+            return self.cfg.host(account.usage_host)
+        local = self.cfg.hosts.get(self.cfg.local_host) if self.cfg.hosts else None
+        if local and (account.config_dir / ".credentials.json").exists():
+            return local
+        return self.cfg.host()
+
+    async def account_token(self, account) -> str | None:
+        host = self.usage_host(account)
+        if host.local:
+            return usage.read_token(account.config_dir)
+        if not await host.reachable():
+            return None
+        try:
+            await host.fill_home()
+            text = await host.op("read", posixpath.join(account.config_dir_on(host), ".credentials.json"))
+        except (HostError, OSError):
+            return None
+        return usage.token_from_text(text)
+
+    async def usage_text(self, account) -> str:
+        host = self.usage_host(account)
+        token = await self.account_token(account)
+        if host.local:
+            return await usage.for_account(self.cfg.claude_bin, account.config_dir, self.child_env(account), token=token)
+        if not token and not await host.reachable():
+            return f"{host.name} is asleep or off, so its login can't be read."
+
+        async def cli():
+            env, unset = config.host_env(self.cfg, account, host)
+            argv, lenv, lcwd = host.command([host.claude_bin or self.cfg.claude_bin, "-p", "/usage"],
+                                            cwd=host.path("~"), env=env, unset=unset)
+            proc = await asyncio.create_subprocess_exec(*argv, env=lenv, cwd=lcwd, stdin=asyncio.subprocess.DEVNULL,
+                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(), 90)
+            except (TimeoutError, asyncio.TimeoutError):
+                proc.kill()
+                raise
+            return out.decode(errors="replace").replace("SEELE_PID", "").strip()
+        return await usage.for_account(self.cfg.claude_bin, account.config_dir, {}, token=token, cli=cli)
 
     async def run_job(self, key: int, channel, prompt: str, *, human: bool = True, new_session: bool = False):
         try:
@@ -368,23 +460,38 @@ class Seele(discord.Client):
         """One Claude Code process for this prompt. True = its old session is gone, run again fresh."""
         conv = self.state.get(key)
         conv.last_prompt = prompt
+        host = self.host_of(conv)
+        if not host.local:
+            async def waking():
+                await channel.send(f"-# 💤 **{host.name}** is asleep: sent Wake-on-LAN, waiting up to "
+                                   f"{host.wake_timeout / 60:g} min for it to boot.")
+            try:
+                await host.ensure_up(on_wake=waking)
+            except HostError as e:
+                await channel.send(f"⚠️ {e}")
+                return False
         cwd, account, model, effort, mode = self.settings_for(conv)
-        if not cwd.is_dir():
-            await channel.send(f"⚠️ Working folder `{cwd}` doesn't exist. Use `/cd`.")
+        try:
+            ok = (await host.op("isdir", cwd)) if not host.local else Path(cwd).is_dir()
+        except HostError as e:
+            await channel.send(f"⚠️ {e}")
+            return False
+        if not ok:
+            await channel.send(f"⚠️ Working folder `{cwd}` doesn't exist on {host.name}. Use `/cd`.")
             return False
         system = self.cfg.system_prompt + "\n\n" + SPEAKER_NOTE
         if self.cfg.people:
             system += " Known people: " + ", ".join(sorted(set(self.cfg.people.values()))) + "."
-        guard = await self.guard_active()
+        guard = await self.guard_active(host)
         if guard and self.cfg.guard_note:
             system += "\n\n" + self.cfg.guard_note
         live = self.cfg.live_input
-        argv = claude.build_argv(self.cfg.claude_bin, session_id=conv.session_id or None, model=model or None,
+        argv = claude.build_argv(host.claude_bin or self.cfg.claude_bin, session_id=conv.session_id or None, model=model or None,
                                  effort=effort or None, mode=mode, system_prompt=system, live=live)
         job = Job(channel, prompt, key=key)
         job.meta = " · ".join(filter(None, [
-            short_path(str(cwd), HOME), account.name, model or "default model",
-            f"effort {effort or default_effort(self.cfg.settings_file) or 'default'}", mode,
+            host.name if len(self.cfg.hosts) > 1 else "", host.short(cwd), account.name, model or "default model",
+            f"effort {effort or await self.saved_effort(host) or 'default'}", mode,
             "🎮 guard on" if guard else ""]))
         job.tracker = agents.Tracker(self.board, key, conv, getattr(channel, "jump_url", "") or "",
                                      on_limit=lambda card, text: self.agent_limited(key, job, card, text, account))
@@ -395,7 +502,10 @@ class Seele(discord.Client):
             job.status = await channel.send(self.render(job, "⏳ **Queued**" if self.slots.locked() else None),
                                             view=job.view)
             async with self.slots:
-                job.run = claude.Run(argv, prompt, cwd, self.child_env(account), live=live)
+                env, unset = config.host_env(self.cfg, account, host)
+                largv, lenv, lcwd = host.command(argv, cwd=cwd, env=env, unset=unset)
+                job.run = claude.Run(largv, prompt, Path(lcwd) if lcwd else None, lenv, live=live,
+                                     remote_stop=None if host.local else host.kill_group)
                 ticker = asyncio.create_task(self.tick(job))
                 async for ev in job.run.events():
                     try:
@@ -628,7 +738,7 @@ class Seele(discord.Client):
         return True
 
     async def reset_from_usage(self, account) -> float | None:
-        token = usage.read_token(account.config_dir)
+        token = await self.account_token(account)
         if not token:
             return None
         try:
@@ -682,7 +792,7 @@ class Seele(discord.Client):
             return
         for path in sorted(folder.glob("*.json")):
             try:
-                if path.stat().st_uid != os.getuid():  # only requests written by this user
+                if hasattr(os, "getuid") and path.stat().st_uid != os.getuid():  # only requests written by this user
                     log.warning("ignoring %s: not ours", path.name)
                     path.rename(path.with_suffix(".rejected"))
                     continue
@@ -736,16 +846,18 @@ class Seele(discord.Client):
                 self.state.convs[str(key)] = self.state.get(parent).inherit()
         return self.state.get(key)
 
-    def _setting(self, name: str, value) -> tuple[str, object]:
+    async def _setting(self, name: str, value, host: Host) -> tuple[str, object]:
         """Validate one `seele conv` setting: (field, new value)."""
         text = str(value).strip()
         if name == "cwd":
-            target = Path(os.path.expanduser(text))
-            if not target.is_absolute():
-                target = self.cfg.projects_root / target
-            if not target.is_dir():
-                raise RequestError(f"{text} is not a folder")
-            return "cwd", str(target.resolve())
+            target, _checked = await check_folder(host, text)
+            if target is None:
+                raise RequestError(f"{text} is not a folder on {host.name}")
+            return "cwd", target
+        if name == "host":
+            if text not in self.cfg.hosts and text != "default":
+                raise RequestError(f"unknown host {text!r}; pick one of {', '.join(self.cfg.hosts)}, default")
+            return "host", "" if text == "default" else text
         if name == "account":
             names = [a.name for a in self.cfg.accounts]
             if text != "auto" and text not in names:
@@ -781,8 +893,17 @@ class Seele(discord.Client):
         raise RequestError(f"unknown setting {name!r}")
 
     async def apply_conv(self, key: int, changes: dict) -> str:
-        new = dict(self._setting(k, v) for k, v in changes.items())  # validate everything first
         conv = await self.ensure_conv(key)
+        new = {}
+        if "host" in changes:  # first: a folder in the same request is on the new host
+            new.update([await self._setting("host", changes["host"], self.host_of(conv))])
+        host = self.cfg.host(new.get("host", conv.host))
+        for k, v in changes.items():  # validate everything before changing anything
+            if k != "host":
+                new.update([await self._setting(k, v, host)])
+        if "host" in new and new["host"] != conv.host:
+            new.setdefault("cwd", "")  # folders and sessions belong to a machine
+            new.setdefault("session_id", "")
         if "cwd" in new and new["cwd"] != conv.cwd and "session_id" not in new:
             new["session_id"] = ""  # sessions belong to a folder, like /cd
         for name, value in new.items():
@@ -846,28 +967,71 @@ def register_commands(bot: Seele):
         conv.session_id = ""
         bot.state.save()
         cwd, *_ = bot.settings_for(conv)
-        await interaction.response.send_message(f"🆕 Next message starts a fresh session in `{short_path(str(cwd), HOME)}`.")
+        host = bot.host_of(conv)
+        await interaction.response.send_message(f"🆕 Next message starts a fresh session in `{host.short(cwd)}`"
+                                                + (f" on **{host.name}**." if len(bot.cfg.hosts) > 1 else "."))
 
     @command("cd", "Change the working folder (starts a fresh session)")
     @app_commands.describe(path="Folder, e.g. a project name or ~/some/path")
     async def cd(interaction: discord.Interaction, path: str):
         if not await guard(interaction):
             return
-        target = Path(os.path.expanduser(path))
-        if not target.is_absolute():
-            target = bot.cfg.projects_root / target
-        if not target.is_dir():
-            return await interaction.response.send_message(f"`{path}` is not a folder.", ephemeral=True)
         conv = conv_of(interaction)
-        conv.cwd, conv.session_id = str(target.resolve()), ""
+        host = bot.host_of(conv)
+        if not host.local:
+            await interaction.response.defer()
+        reply = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+        try:
+            target, checked = await check_folder(host, path)
+        except HostError as e:
+            return await reply(f"⚠️ {e}", ephemeral=True)
+        if target is None:
+            return await reply(f"`{path}` is not a folder on {host.name}.", ephemeral=True)
+        conv.cwd, conv.session_id = target, ""
         bot.state.save()
-        acc = bot.cfg.account_for(target, conv.account or None)
-        await interaction.response.send_message(
-            f"📁 Working in `{short_path(conv.cwd, HOME)}` (account **{acc.name}**). Fresh session next message.")
+        acc = bot.cfg.account_for(target, conv.account or None, host)
+        where = f" on **{host.name}**" if len(bot.cfg.hosts) > 1 else ""
+        note = f" ({host.name} is asleep, so the folder isn't checked yet)" if not checked else ""
+        await reply(f"📁 Working in `{host.short(conv.cwd)}`{where} (account **{acc.name}**){note}. "
+                    "Fresh session next message.")
 
     @cd.autocomplete("path")
-    async def cd_complete(_interaction, current: str):
-        return [app_commands.Choice(name=n[:100], value=v[:100]) for n, v in folder_choices(bot.cfg, current)]
+    async def cd_complete(interaction, current: str):
+        host = bot.host_of(conv_of(interaction))
+        if host.local:
+            found = folder_choices(bot.cfg, current)
+        else:
+            try:
+                found = await asyncio.wait_for(remote_folder_choices(host, current), 2.5)
+            except (asyncio.TimeoutError, TimeoutError, HostError, OSError):
+                found = []
+        return [app_commands.Choice(name=n[:100], value=v[:100]) for n, v in found]
+
+    @command("host", "Pick which machine runs Claude for this conversation (fresh session, its default folder)")
+    @app_commands.describe(name="Machine name, or default")
+    async def host_cmd(interaction: discord.Interaction, name: str):
+        if not await guard(interaction):
+            return
+        if name != "default" and name not in bot.cfg.hosts:
+            return await interaction.response.send_message(
+                f"Unknown machine. Pick one of: {', '.join(bot.cfg.hosts)}, default.", ephemeral=True)
+        conv = conv_of(interaction)
+        new = "" if name == "default" else name
+        if new != conv.host:
+            conv.host, conv.cwd, conv.session_id = new, "", ""
+            bot.state.save()
+        host = bot.host_of(conv)
+        await interaction.response.defer()
+        awake = await host.reachable()
+        cwd, acc, *_ = bot.settings_for(conv)
+        state = "" if host.local else (" · awake" if awake else
+                                       (" · asleep: the next message wakes it" if host.mac else " · not answering"))
+        await interaction.followup.send(f"🖥️ Running on **{host.name}**{' (default)' if not conv.host else ''}{state}. "
+                                        f"Folder `{host.short(cwd)}`, account **{acc.name}**, fresh session next message.")
+
+    @host_cmd.autocomplete("name")
+    async def host_complete(_interaction, current: str):
+        return [app_commands.Choice(name=n, value=n) for n in ["default", *bot.cfg.hosts] if current.lower() in n.lower()]
 
     @command("effort", "Set the effort level for this conversation, or Claude Code's default")
     @app_commands.describe(level="Effort level", everywhere="Also save it as Claude Code's default (like /effort)")
@@ -876,16 +1040,22 @@ def register_commands(bot: Seele):
         if not await guard(interaction):
             return
         conv = conv_of(interaction)
+        host = bot.host_of(conv)
+        await interaction.response.defer()
         if everywhere and level.value != "default":
-            models = set_default_effort(bot.cfg.settings_file, level.value)
+            try:
+                models = await bot.save_effort(host, level.value)
+            except (HostError, OSError, ValueError) as e:
+                return await interaction.followup.send(f"⚠️ Couldn't save it on {host.name}: {e}")
             conv.effort = ""
             bot.state.save()
-            return await interaction.response.send_message(
-                f"⚙️ Claude Code's default effort is now **{level.value}** ({', '.join(models)}), here and in the terminal.")
+            return await interaction.followup.send(
+                f"⚙️ Claude Code's default effort on {host.name} is now **{level.value}** ({', '.join(models)}), "
+                "here and in the terminal.")
         conv.effort = "" if level.value == "default" else level.value
         bot.state.save()
-        shown = conv.effort or f"default ({default_effort(bot.cfg.settings_file) or 'CLI default'})"
-        await interaction.response.send_message(f"⚙️ Effort here: **{shown}**.")
+        shown = conv.effort or f"default ({await bot.saved_effort(host) or 'CLI default'})"
+        await interaction.followup.send(f"⚙️ Effort here: **{shown}**.")
 
     @command("model", "Set the model for this conversation")
     @app_commands.describe(name="claude-opus-5-5, opus, sonnet, haiku, fable, a full model id, or default")
@@ -938,8 +1108,7 @@ def register_commands(bot: Seele):
             return
         await interaction.response.defer(thinking=True)
         embed = discord.Embed(title="Claude usage", color=0xE8590C)
-        results = await asyncio.gather(*[
-            usage.for_account(bot.cfg.claude_bin, a.config_dir, bot.child_env(a)) for a in bot.cfg.accounts])
+        results = await asyncio.gather(*[bot.usage_text(a) for a in bot.cfg.accounts])
         for acc, text in zip(bot.cfg.accounts, results):
             embed.add_field(name=acc.name, value=text[:1024], inline=False)
         running = len(bot.jobs)
@@ -955,7 +1124,8 @@ def register_commands(bot: Seele):
         if not cmd:
             return await interaction.response.send_message("No cost command configured.", ephemeral=True)
         await interaction.response.defer(thinking=True)
-        proc = await asyncio.create_subprocess_exec(*shlex.split(cmd), "-d", str(days),
+        parts = [cmd] if os.path.exists(cmd) else shlex.split(cmd, posix=os.name != "nt")
+        proc = await asyncio.create_subprocess_exec(*parts, "-d", str(days),
                                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
                                                     env={**os.environ, "NO_COLOR": "1"})
         try:
@@ -974,21 +1144,32 @@ def register_commands(bot: Seele):
         if not await guard(interaction):
             return
         conv = conv_of(interaction)
+        host = bot.host_of(conv)
+        await interaction.response.defer(ephemeral=True)
+        awake = await host.reachable()
+        if awake:
+            try:
+                await host.fill_home()
+            except HostError:
+                pass
         cwd, acc, model_, effort_, mode_ = bot.settings_for(conv)
         job = bot.jobs.get(interaction.channel_id)
-        saved = default_effort(bot.cfg.settings_file) or "CLI default"
-        lines = [
-            f"**Folder** `{short_path(str(cwd), HOME)}`",
+        saved = (await bot.saved_effort(host) if awake else "") or "CLI default"
+        lines = []
+        if len(bot.cfg.hosts) > 1 or not host.local:
+            lines.append(f"**Machine** {host.name}{' (default)' if not conv.host else ''}"
+                         + ("" if host.local else (" · awake" if awake else " · asleep/off")))
+        lines += [
+            f"**Folder** `{host.short(cwd)}`",
             f"**Account** {acc.name}{' (auto)' if not conv.account else ''}",
             f"**Model** {model_ or 'default'}",
             f"**Effort** {effort_ or 'default (' + saved + ')'}",
             f"**Mode** {mode_}",
         ]
         if conv.session_id:
-            prefix = "" if acc.config_dir.resolve() == (Path.home() / ".claude").resolve() \
-                else f"CLAUDE_CONFIG_DIR={short_path(str(acc.config_dir), HOME)} "
-            lines.append(f"**Session** `{conv.session_id}` · terminal: `cd {short_path(str(cwd), HOME)} && "
-                         f"{prefix}claude --resume {conv.session_id}`")
+            prefix = "" if acc.is_default_dir(host) else f"CLAUDE_CONFIG_DIR={host.short(acc.config_dir_on(host))} "
+            lines.append(f"**Session** `{conv.session_id}` · terminal{'' if host.local else ' on ' + host.name}: "
+                         f"`cd {host.short(cwd)} && {prefix}claude --resume {conv.session_id}`")
         else:
             lines.append("**Session** fresh on next message")
         if conv.agents_channel:
@@ -1005,9 +1186,9 @@ def register_commands(bot: Seele):
                          + (f", {running} agents" if running else "")
                          + (f", {queued} queued" if queued else ""))
         lines.append(f"**Busy here** {len(bot.jobs)} prompt(s) running across all chats")
-        if await bot.guard_active():
-            lines.append(f"🎮 `{bot.cfg.guard_process}` is running: Claude is told to keep it light")
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        if awake and await bot.guard_active(host):
+            lines.append(f"🎮 `{bot.cfg.guard_process}` is running on {host.name}: Claude is told to keep it light")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
 
     @command("stop", "Stop the running prompt here, drop queued messages and any scheduled auto-resume")
     async def stop(interaction: discord.Interaction):
@@ -1021,29 +1202,57 @@ def register_commands(bot: Seele):
         if not await guard(interaction):
             return
         conv = conv_of(interaction)
-        cwd, acc, *_ = bot.settings_for(conv)
-        found = await asyncio.to_thread(claude.recent_sessions, acc.config_dir, cwd, 25)
+        host = bot.host_of(conv)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            if not host.local and not await host.reachable():
+                raise HostError(f"{host.name} is asleep or off: its sessions live there.")
+            await host.fill_home()
+            cwd, acc, *_ = bot.settings_for(conv)
+            if host.local:
+                found = await asyncio.to_thread(claude.recent_sessions, acc.config_dir, Path(cwd), 25)
+            else:
+                found = [tuple(x) for x in await host.op("sessions", acc.config_dir_on(host), cwd, "25")]
+        except HostError as e:
+            return await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
         if not found:
-            return await interaction.response.send_message(f"No sessions in `{short_path(str(cwd), HOME)}` yet.",
-                                                           ephemeral=True)
+            return await interaction.followup.send(f"No sessions in `{host.short(cwd)}` yet.", ephemeral=True)
         view = discord.ui.View(timeout=600)
         view.add_item(SessionSelect(bot, interaction.channel_id, found))
-        await interaction.response.send_message(f"Sessions in `{short_path(str(cwd), HOME)}`:", view=view,
-                                                ephemeral=True)
+        await interaction.followup.send(f"Sessions in `{host.short(cwd)}`:", view=view, ephemeral=True)
 
-    @command("get", "Upload a file from this machine")
-    @app_commands.describe(path="Absolute path or ~/path")
+    @command("get", "Upload a file from the machine this conversation runs on")
+    @app_commands.describe(path="Absolute path, ~/path, or relative to the working folder")
     async def get(interaction: discord.Interaction, path: str):
         if not await guard(interaction):
             return
-        target = Path(os.path.expanduser(path))
-        if not target.is_absolute():
-            target = Path(conv_of(interaction).cwd or bot.cfg.default_cwd) / target
-        if not target.is_file():
-            return await interaction.response.send_message(f"`{path}` is not a file.", ephemeral=True)
-        if target.stat().st_size > bot.cfg.max_upload_mb * 1024 * 1024:
-            return await interaction.response.send_message(f"Bigger than {bot.cfg.max_upload_mb} MB.", ephemeral=True)
-        await interaction.response.send_message(file=discord.File(target))
+        conv = conv_of(interaction)
+        host = bot.host_of(conv)
+        if host.local:
+            target = Path(os.path.expanduser(path))
+            if not target.is_absolute():
+                target = Path(bot.settings_for(conv)[0]) / target
+            if not target.is_file():
+                return await interaction.response.send_message(f"`{path}` is not a file.", ephemeral=True)
+            if target.stat().st_size > bot.cfg.max_upload_mb * 1024 * 1024:
+                return await interaction.response.send_message(f"Bigger than {bot.cfg.max_upload_mb} MB.", ephemeral=True)
+            return await interaction.response.send_message(file=discord.File(target))
+        await interaction.response.defer()
+        try:
+            if not await host.reachable():
+                raise HostError(f"{host.name} is asleep or off.")
+            await host.fill_home()
+            text = path.strip()
+            target = host.path(text) if text.startswith(("/", "~")) else posixpath.join(bot.settings_for(conv)[0], text)
+            size = await host.op("size", target)
+            if size is None:
+                raise HostError(f"`{path}` is not a file on {host.name}.")
+            if size > bot.cfg.max_upload_mb * 1024 * 1024:
+                raise HostError(f"Bigger than {bot.cfg.max_upload_mb} MB.")
+            data = await host.fetch(target)
+        except HostError as e:
+            return await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
+        await interaction.followup.send(file=discord.File(io.BytesIO(data), posixpath.basename(target)))
 
     @command("listen", "In a server channel: answer every message here, not only mentions")
     async def listen(interaction: discord.Interaction, on: bool = True):
@@ -1090,6 +1299,35 @@ def register_commands(bot: Seele):
             await send(f"⚠️ {error}", ephemeral=True)
         except discord.HTTPException:
             pass
+
+
+async def check_folder(host: Host, text: str) -> tuple[str | None, bool]:
+    """(the folder's path on `host`, or None if it isn't one; whether it was checked). A host that's
+    asleep can't be asked, so its folder is taken as given (the run checks it after the wake-up)."""
+    if host.local:
+        p = Path(host.path(text))
+        return (str(p.resolve()), True) if p.is_dir() else (None, True)
+    if not await host.reachable():
+        return host.path(text), False
+    await host.fill_home()
+    real = await host.op("isdir", host.path(text))
+    return (real, True) if real else (None, True)
+
+
+async def remote_folder_choices(host: Host, current: str, limit: int = 25) -> list[tuple[str, str]]:
+    """/cd autocomplete on another machine (needs it awake)."""
+    current = current.strip()
+    if not await host.reachable(timeout=2):
+        return []
+    await host.fill_home()
+    if "/" in current or current.startswith("~"):
+        typed = host.path(current)
+        base, stem = (typed, "") if current.endswith("/") else (posixpath.dirname(typed), posixpath.basename(typed))
+        return [(host.short(p), p) for p in await host.op("dirs", base, stem, str(limit), timeout=2.5)]
+    out = [("~ (home)", host.home)] if "home".startswith(current.lower()) or not current else []
+    projects = await host.op("dirs", host.path(host.projects_root), "", "200", timeout=2.5)
+    out += [(posixpath.basename(p), p) for p in projects if current.lower() in posixpath.basename(p).lower()]
+    return out[:limit]
 
 
 def folder_choices(cfg: Config, current: str, limit: int = 25) -> list[tuple[str, str]]:

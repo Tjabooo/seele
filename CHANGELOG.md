@@ -4,6 +4,18 @@ All notable changes to this project are listed here ([Keep a Changelog](https://
 
 ## [Unreleased]
 
+- **Hosts: the bot on one machine, Claude on others.** `[hosts]` names machines reached over SSH;
+  each conversation runs on one (`/host`, `seele conv --host`, `default_host` for new ones). A host
+  with a `mac` is woken with Wake-on-LAN (re-sent every 30 s, up to `wake_timeout`) when it doesn't
+  answer. Runs import the host user's systemd session environment, Stop kills the remote process
+  group, and folders, `/cd` completion, `/sessions`, `/get`, attachments, `/effort everywhere`, the
+  guard check and `/usage` logins all work on the conversation's machine.
+- **Windows:** `install.ps1` (venv + boot-time scheduled task with a restart loop, log file via
+  `SEELE_LOG_FILE`); no POSIX-only calls on the bot's path (process groups, uid checks, `pgrep`).
+- `[bot] ssh` on a CLI-only machine relays `seele conv` / `seele prompt` to the bot over SSH
+  (`seele enqueue` on the bot's machine); `install.sh` then leaves the service off.
+- `seele check` lists the hosts and whether they answer.
+
 - **Auto-resume after background agents hit a limit**: an agent whose task-notification failed on a
   usage limit ("You've hit your 5-hour limit · resets 10:10pm (Europe/Stockholm)", weekly wording too)
   now schedules the conversation's auto-resume (reset from the message, else the run's rate-limit event,

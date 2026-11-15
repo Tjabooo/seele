@@ -22,8 +22,16 @@ LABELS = {
 def read_token(config_dir: Path) -> str | None:
     """The account's OAuth access token, or None if missing or expired."""
     try:
-        oauth = json.loads((config_dir / ".credentials.json").read_text())["claudeAiOauth"]
-    except (OSError, KeyError, json.JSONDecodeError):
+        return token_from_text((config_dir / ".credentials.json").read_text())
+    except OSError:
+        return None
+
+
+def token_from_text(text: str | None) -> str | None:
+    """The OAuth access token in a .credentials.json's text, or None if missing or expired."""
+    try:
+        oauth = json.loads(text or "")["claudeAiOauth"]
+    except (KeyError, TypeError, json.JSONDecodeError):
         return None
     if oauth.get("expiresAt", 0) / 1000 < time.time() + 60:
         return None
@@ -165,9 +173,11 @@ async def account_windows(binary: str, config_dir: Path, env: dict[str, str]) ->
     return {**found, "source": "cli"} if found else {"error": text.strip()[:300] or "no usage reported"}
 
 
-async def for_account(binary: str, config_dir: Path, env: dict[str, str]) -> str:
-    """Usage text for one account. Falls back to `claude -p /usage`, which refreshes the login."""
-    token = read_token(config_dir)
+async def for_account(binary: str, config_dir: Path, env: dict[str, str], *,
+                      token: str | None = None, cli=None) -> str:
+    """Usage text for one account. Falls back to `claude -p /usage`, which refreshes the login.
+    `token` skips reading the local login; `cli` (async, returns the text) replaces the local CLI run."""
+    token = token or read_token(config_dir)
     if token:
         try:
             data = await asyncio.to_thread(fetch, token)
@@ -175,8 +185,10 @@ async def for_account(binary: str, config_dir: Path, env: dict[str, str]) -> str
         except Exception:
             pass
     try:
-        text = await cli_usage(binary, config_dir, env)
-    except TimeoutError:
+        text = await (cli() if cli else cli_usage(binary, config_dir, env))
+    except (TimeoutError, asyncio.TimeoutError):
         return "Timed out asking Claude Code for usage."
+    except Exception as e:  # e.g. the host went away
+        return f"Couldn't ask Claude Code for usage: {e}"
     keep = [ln for ln in text.splitlines() if "% used" in ln or "resets" in ln]
     return "\n".join(keep) or text.strip()[:900]

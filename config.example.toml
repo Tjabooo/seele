@@ -46,6 +46,30 @@ config_dir = "~/.claude"
 # paths = ["~/Projects/some-project"]
 # effort = "xhigh"           # default effort for this account (a conversation's /effort wins)
 
+# Machines that run Claude Code. Without [hosts] everything runs on this machine. With them, each
+# conversation picks one with /host (new ones use default_host); prompts go there over SSH (key
+# login, ~/.ssh/config aliases) and a machine with a `mac` is woken with Wake-on-LAN first.
+# The machine the bot runs on is always a host too, named host_name, with the [claude] settings.
+# host_name = "server"       # this machine (default: its hostname)
+# default_host = "desktop"
+# [hosts.desktop]
+# ssh = "desktop"            # ssh destination: alias or user@address
+# mac = "aa:bb:cc:dd:ee:ff"  # Wake-on-LAN (leave out: a sleeping machine is reported, not woken)
+# broadcast = "255.255.255.255"
+# home = "/home/me"          # its home folder (asked over SSH when left out)
+# default_cwd = "~"
+# projects_root = "~/Projects"
+# binary = "claude"          # found on the machine's PATH plus ~/.local/bin
+# wake_timeout = 240         # seconds to wait for it to boot
+# The machine needs bash, python3 and a logged-in `claude`. Account config_dir/paths above are
+# read on whichever machine runs the prompt; usage_host = "desktop" says where /usage reads a login.
+
+# On a machine that only has the CLI (the bot runs elsewhere): send `seele conv` / `seele prompt`
+# to the bot over SSH. `command` is the seele CLI on that machine.
+# [bot]
+# ssh = "server"
+# command = 'C:\Users\me\.local\share\seele\venv\Scripts\seele.exe'
+
 # While this process runs, Claude is told to keep it light (e.g. a game on the same machine).
 [guard]
 process = ""
