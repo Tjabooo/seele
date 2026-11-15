@@ -10,7 +10,7 @@ All notable changes to this project are listed here ([Keep a Changelog](https://
   answer. Runs import the host user's systemd session environment, Stop kills the remote process
   group, and folders, `/cd` completion, `/sessions`, `/get`, attachments, `/effort everywhere`, the
   guard check and `/usage` logins all work on the conversation's machine.
-- **Windows:** `install.ps1` (venv + boot-time scheduled task with a restart loop, log file via
+- **Windows:** the bot uses Git for Windows' `ssh.exe` (the system OpenSSH 9.5 never passes piped input on); `[ssh] binary` / `options` (e.g. `-F` an alias file) configure it. `install.ps1` (venv + boot-time scheduled task with a restart loop, log file via
   `SEELE_LOG_FILE`); no POSIX-only calls on the bot's path (process groups, uid checks, `pgrep`).
 - `[bot] ssh` on a CLI-only machine relays `seele conv` / `seele prompt` to the bot over SSH
   (`seele enqueue` on the bot's machine); `install.sh` then leaves the service off.

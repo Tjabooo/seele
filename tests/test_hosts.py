@@ -153,6 +153,8 @@ paths = ["~/Projects/helix-hollow"]
 [bot]
 ssh = "home-server"
 command = "seele.exe"
+[ssh]
+options = ["-F", "C:/x/ssh_config"]
 ''')
     cfg = config.load(path)
     assert list(cfg.hosts) == ["geofront", "magi", "unit"] and cfg.host().name == "magi"
@@ -164,6 +166,7 @@ command = "seele.exe"
     assert config.host_env(cfg, c2, magi)[0]["CLAUDE_CONFIG_DIR"] == "/home/me/.claude-2"
     assert config.host_env(cfg, cfg.accounts[0], magi)[1] == ("CLAUDE_CONFIG_DIR",)
     assert (cfg.bot_ssh, cfg.bot_command) == ("home-server", "seele.exe")
+    assert magi.ssh_argv("true")[2:4] == ["-F", "C:/x/ssh_config"]
 
 
 def test_config_rejects_unknown_default_host(tmp_path):

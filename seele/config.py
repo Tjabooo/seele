@@ -181,6 +181,7 @@ def load(path: Path = CONFIG_PATH) -> Config:
     cfg.local_host = str(raw.get("host_name") or socket.gethostname().split(".")[0].lower() or "local")
     cfg.hosts[cfg.local_host] = Host(cfg.local_host, default_cwd=str(cfg.default_cwd),
                                      projects_root=str(cfg.projects_root))
+    ssh = raw.get("ssh", {})
     for name, h in raw.get("hosts", {}).items():
         if name == cfg.local_host and not h.get("ssh"):
             continue  # this machine: [claude] has its settings
@@ -188,7 +189,9 @@ def load(path: Path = CONFIG_PATH) -> Config:
                                broadcast=h.get("broadcast", "255.255.255.255"), home=h.get("home", ""),
                                claude_bin=h.get("binary", ""), default_cwd=h.get("default_cwd", "~"),
                                projects_root=h.get("projects_root", "~/Projects"),
-                               wake_timeout=float(h.get("wake_timeout", 240)), ssh_bin=h.get("ssh_binary", ""))
+                               wake_timeout=float(h.get("wake_timeout", 240)),
+                               ssh_bin=h.get("ssh_binary", ssh.get("binary", "")),
+                               ssh_opts=tuple(str(x) for x in h.get("ssh_options", ssh.get("options", []))))
     cfg.default_host = str(raw.get("default_host") or cfg.local_host)
     if cfg.default_host not in cfg.hosts:
         raise ValueError(f"default_host {cfg.default_host!r} is not in [hosts] (have: {', '.join(cfg.hosts)})")

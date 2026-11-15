@@ -61,6 +61,12 @@ config_dir = "~/.claude"
 # projects_root = "~/Projects"
 # binary = "claude"          # found on the machine's PATH plus ~/.local/bin
 # wake_timeout = 240         # seconds to wait for it to boot
+# ssh_binary / ssh_options per host override [ssh] below.
+# [ssh]
+# binary = "ssh"             # default: ssh; on Windows Git for Windows' ssh.exe (the system's
+#                            # OpenSSH doesn't pass piped input on); put -F PATH in options if your
+#                            # aliases live in a file it doesn't read
+# options = ["-F", "C:/Users/me/.ssh/config"]
 # The machine needs bash, python3 and a logged-in `claude`. Account config_dir/paths above are
 # read on whichever machine runs the prompt; usage_host = "desktop" says where /usage reads a login.
 

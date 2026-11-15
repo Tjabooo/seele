@@ -37,9 +37,16 @@ def _windows_ssh(name: str) -> str:
     return str(path) if path.exists() else name
 
 
+GIT_SSH = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "usr" / "bin" / "ssh.exe"
+
+
 def default_ssh() -> str:
-    """Windows' own OpenSSH reads ~/.ssh/config; Git Bash's ssh, first on PATH there, may not."""
-    return _windows_ssh("ssh.exe") if os.name == "nt" else "ssh"
+    """On Windows, Git for Windows' ssh: the system's OpenSSH (9.5) never passes a pipe's data or
+    EOF on to the remote command, which a run's stdin needs. Git's ssh may not follow an `Include`
+    with a Windows path in ~/.ssh/config: point [ssh] options at the file (-F PATH) then."""
+    if os.name != "nt":
+        return "ssh"
+    return str(GIT_SSH) if GIT_SSH.exists() else _windows_ssh("ssh.exe")
 
 
 def magic_packet(mac: str) -> bytes:
@@ -65,6 +72,7 @@ class Host:
     projects_root: str = "~/Projects"
     wake_timeout: float = 240.0  # seconds to wait for a woken host to answer
     ssh_bin: str = ""
+    ssh_opts: tuple = ()  # extra ssh arguments, e.g. ("-F", "path/to/ssh_config")
     _up_at: float = 0.0  # when it last answered
 
     @property
@@ -105,7 +113,7 @@ class Host:
 
     # ---------- commands ----------
     def ssh_argv(self, command: str, *, connect_timeout: int = 8) -> list[str]:
-        return [self.ssh_bin or default_ssh(), "-T", "-o", "BatchMode=yes",
+        return [self.ssh_bin or default_ssh(), "-T", *self.ssh_opts, "-o", "BatchMode=yes",
                 "-o", f"ConnectTimeout={connect_timeout}", "-o", "ServerAliveInterval=30",
                 "-o", "ServerAliveCountMax=4", self.ssh, command]
 
