@@ -17,7 +17,7 @@ from pathlib import Path
 import discord
 from discord import app_commands
 
-from . import agents, claude, config, net, usage
+from . import agents, claude, config, lights, net, usage
 from .hosts import Host, HostError
 from .config import (SPEAKER_NOTE, Config, Conversation, State, apply_effort, default_effort, effort_in,
                      set_default_effort,
@@ -207,6 +207,15 @@ def merged(*lists: list[dict]) -> list[dict]:
     return out
 
 
+def outcome_light(job: Job | None, conv: Conversation, crashed: bool = False) -> str:
+    """🟢 when the prompt's last turn went through; 🔴 when it failed, was stopped, never ran or waits
+    for an auto-resume."""
+    result = job.last_result if job else None
+    if crashed or result is None or result.is_error or result.data.get("subtype") == "stopped":
+        return lights.HALTED
+    return lights.HALTED if resume_pending(conv) else lights.DONE
+
+
 def when_text(at: float, now: float | None = None) -> str:
     """A Discord timestamp: every reader sees it in their own local time."""
     now = time.time() if now is None else now
@@ -231,6 +240,7 @@ class Seele(discord.Client):
         self.net = net.ApiWatch(settle=API_SETTLE)  # is the API back after an outage?
         self.api_every = API_EVERY
         self.backoff = RETRY_BACKOFF
+        self.lights = lights.Lights()  # 🟠/🟢/🔴 in front of thread names
         register_commands(self)
 
     # ---------- setup ----------
@@ -252,6 +262,7 @@ class Seele(discord.Client):
                 self.owners = {info.owner.id}
         log.info("connected as %s; owners %s", self.user, sorted(self.owners))
         await self.greet()
+        self.spawn(self.relight())
         try:
             await self.board.orphans()
         except Exception:
@@ -272,6 +283,26 @@ class Seele(discord.Client):
                 log.warning("could not DM owner %s yet: %s", uid, e)
         flags.last_prompt = " ".join(sorted(done))
         self.state.save()
+
+    def mark(self, key: int, channel, light: str):
+        """Show how this thread's latest prompt is doing in front of its name."""
+        if not self.lights.set(channel, light):
+            return
+        conv = self.state.get(key)
+        if conv.light != light:
+            conv.light = light
+            self.state.save()
+
+    async def relight(self):
+        """After a restart: threads still marked working lost their prompt with the old process."""
+        for key, conv in list(self.state.convs.items()):
+            if conv.light == lights.BUSY and key.isdigit() and int(key) not in self.jobs:
+                channel = await self.channel_by_id(int(key))
+                if channel is None:
+                    conv.light = ""
+                    self.state.save()
+                elif int(key) not in self.jobs:
+                    self.mark(int(key), channel, lights.HALTED)
 
     async def on_interaction(self, interaction: discord.Interaction):
         if self.is_owner_id(interaction.user.id):
@@ -322,7 +353,7 @@ class Seele(discord.Client):
             if not (mentioned or (conv and conv.listen)):
                 return
             try:  # every new prompt in a channel gets its own thread (= its own Claude session)
-                thread = await msg.create_thread(name=thread_name(content or "Claude"),
+                thread = await msg.create_thread(name=lights.named(lights.BUSY, thread_name(content or "Claude")),
                                                  auto_archive_duration=1440)
                 self.state.convs[str(thread.id)] = conv.inherit() if conv else Conversation()
                 channel, key = thread, thread.id
@@ -496,6 +527,8 @@ class Seele(discord.Client):
         return await usage.for_account(self.cfg.claude_bin, account.config_dir, {}, token=token, cli=cli)
 
     async def run_job(self, key: int, channel, prompt: str, *, human: bool = True, new_session: bool = False):
+        crashed = False
+        self.mark(key, channel, lights.BUSY)
         try:
             conv = self.state.get(key)
             if new_session:
@@ -515,14 +548,17 @@ class Seele(discord.Client):
             while await self.attempt(key, channel, prompt, retried):
                 retried = True
         except Exception as e:  # never leave a conversation stuck
+            crashed = True
             log.exception("job failed")
             try:
                 await channel.send(f"⚠️ Bot error: `{e}`")
             except SEND_ERRORS:
                 pass
         finally:
-            self.jobs.pop(key, None)
+            job = self.jobs.pop(key, None)
             pending = self.queue.pop(key, None)
+            if not pending:
+                self.mark(key, channel, outcome_light(job, self.state.get(key), crashed))
             if pending:
                 self.submit(key, channel, "\n\n".join(p.prompt for p in pending),
                             human=any(p.human for p in pending), new_session=any(p.new_session for p in pending))

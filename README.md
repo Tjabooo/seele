@@ -24,6 +24,10 @@ seele ▸ ✅ Done · 1:07 · 9 tools · 5 h 13% · `3f2a91c0`
 - **Prompt from anywhere.** DMs work out of the box. In a server, mention the bot (or turn on
   `/listen` in a channel) and every prompt gets its own thread, so each thread is its own
   Claude session.
+- **Thread lights.** A thread's name starts with how its latest prompt is doing: 🟠 working,
+  🟢 finished, 🔴 not finished (failed, stopped, cut off by a restart or waiting for an
+  auto-resume). Discord allows two renames per thread per 10 minutes, so a quick follow-up can
+  skip straight to its final light.
 - **Live progress.** One status message shows the elapsed time, tool calls and Claude's running
   commentary, with a **Stop** button.
 - **Talk while it works.** A message sent while Claude is busy goes straight into the running

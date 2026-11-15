@@ -230,6 +230,7 @@ class Conversation:
     resume_tries: int = 0  # auto-resumes in a row that failed again on an outage (backoff)
     resume_last: float = 0.0  # when the last auto-resume went out
     resume_sent: list = field(default_factory=list)  # the agents it named, until a turn goes through
+    light: str = ""  # threads: the 🟠/🟢/🔴 their name shows (see lights.py)
 
     def inherit(self) -> "Conversation":
         """Settings a new thread takes from its channel (no session)."""

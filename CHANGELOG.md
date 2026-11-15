@@ -4,6 +4,11 @@ All notable changes to this project are listed here ([Keep a Changelog](https://
 
 ## [Unreleased]
 
+- **Thread lights**: conversation threads are renamed to start with 🟠 (working), 🟢 (finished) or
+  🔴 (failed, stopped, cut off by a restart, or waiting for an auto-resume). New prompt threads are
+  created with 🟠 already. Renames respect Discord's 2-per-10-minutes limit per thread and only the
+  newest light is applied; no permission turns lights off for that thread. After a restart, threads
+  still showing 🟠 turn 🔴. New state field `light`.
 - **Auto-resume after network outages and API server errors**, not only usage limits. One table
   (`claude.TRANSIENT`) sorts failure texts into `limit`, `network` (`Can't reach the API server`,
   `EAI_AGAIN`, `ENOTFOUND`, `ECONNRESET`, `ETIMEDOUT`, `ECONNREFUSED`, `Connection error`/`lost`,

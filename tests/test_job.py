@@ -858,3 +858,29 @@ def test_outage_and_limit_dedupe_and_a_limit_resume_waits_for_the_network(bot):
     [call] = calls(fake)
     assert call["prompt"].startswith("The usage limit has reset and the API answers again after the network outage ")
     assert "Agents the limit and the network outage " in call["prompt"] and call["prompt"].endswith("- `a7`: seven")
+
+
+class ThreadChannel(Channel):
+    """A conversation thread: its name carries the 🟠/🟢/🔴 light."""
+
+    def __init__(self, cid=1, name="hello"):
+        super().__init__(cid)
+        self.name, self.names = name, []
+
+    async def edit(self, name):
+        self.name = name
+        self.names.append(name)
+
+
+def test_thread_light_follows_the_prompt(bot):
+    b, fake = bot
+    b.lights.is_thread = lambda ch: isinstance(ch, ThreadChannel)
+    th = ThreadChannel()
+
+    async def go():
+        b.submit(1, th, "hello")
+        await until(lambda: not b.jobs)
+        await until(lambda: all(w.done() for w in b.lights.workers.values()))
+    asyncio.run(go())
+    assert th.names == ["🟠 hello", "🟢 hello"]
+    assert b.state.get(1).light == "🟢"
