@@ -320,6 +320,9 @@ def test_codex_channel_opens_fresh_threads_and_inherits_settings(bot, tmp_path, 
     parent = b.state.get(channel.id)
     parent.session_id, parent.cwd = "old-channel-session", str(tmp_path)
     parent.model, parent.effort = "custom-model", "high"
+    parent.listen = True  # Codex channels require mentions even with an older listen setting.
+    bot_user = SimpleNamespace(id=99)
+    monkeypatch.setattr(b._connection, "user", bot_user)
     monkeypatch.setattr(botmod.discord, "Thread", ChatThread)
     delivered = []
 
@@ -337,8 +340,13 @@ def test_codex_channel_opens_fresh_threads_and_inherits_settings(bot, tmp_path, 
     author = SimpleNamespace(bot=False, id=42, display_name="Alice")
 
     async def go():
-        for content in ("first topic", "second topic"):
+        for content in ("ordinary conversation", "codex please do something", "<@123> hello"):
             await b.on_message(SimpleNamespace(author=author, channel=channel, mentions=[], content=content,
+                                               attachments=[], create_thread=create_thread))
+        assert not delivered and not channel.threads
+        for content in ("first topic", "second topic"):
+            await b.on_message(SimpleNamespace(author=author, channel=channel, mentions=[bot_user],
+                                               content=f"<@99> {content}",
                                                attachments=[], create_thread=create_thread))
         thread = delivered[0][1]
         await b.on_message(SimpleNamespace(author=author, channel=thread, mentions=[], content="follow up",
@@ -350,6 +358,7 @@ def test_codex_channel_opens_fresh_threads_and_inherits_settings(bot, tmp_path, 
 
     asyncio.run(go())
     first, second, follow_up = delivered
+    assert first[2] == "[Discord message from Alice]\nfirst topic"
     assert first[0] != second[0] and follow_up[0] == first[0]
     assert len(channel.threads) == 2
     for key in channel.threads:
@@ -359,16 +368,18 @@ def test_codex_channel_opens_fresh_threads_and_inherits_settings(bot, tmp_path, 
     assert b.state.get(channel.id).session_id == "old-channel-session"
 
 
-def test_thread_creation_failure_does_not_start_a_shared_session(bot):
+def test_thread_creation_failure_does_not_start_a_shared_session(bot, monkeypatch):
     b, fake = bot
     channel = Channel(7)
     b.cfg.codex.channels = {channel.id}
     b.owners = {42}
+    bot_user = SimpleNamespace(id=99)
+    monkeypatch.setattr(b._connection, "user", bot_user)
 
     async def create_thread(**kwargs):
         raise botmod.discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "Missing Permissions")
 
-    msg = SimpleNamespace(author=SimpleNamespace(bot=False, id=42), channel=channel, mentions=[],
+    msg = SimpleNamespace(author=SimpleNamespace(bot=False, id=42), channel=channel, mentions=[bot_user],
                           content="new topic", attachments=[], create_thread=create_thread)
     asyncio.run(b.on_message(msg))
     assert not b.jobs and not calls(fake)

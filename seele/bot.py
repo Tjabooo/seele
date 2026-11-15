@@ -248,7 +248,7 @@ class Seele(discord.Client):
             key = channel.id
         else:
             conv = self.state.convs.get(str(channel.id))
-            if not (self.is_codex(channel) or mentioned or (conv and conv.listen)):
+            if not (mentioned or (conv and conv.listen and not self.is_codex(channel))):
                 return
             try:  # every new prompt in a channel gets its own thread and session
                 agent = "Codex" if self.is_codex(channel) else "Claude"

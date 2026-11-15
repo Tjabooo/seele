@@ -96,8 +96,9 @@ model = "gpt-6.1-sol"
 effort = "xhigh"
 ```
 
-After restarting SEELE, each message from a configured owner in that text channel opens a new
-thread with a fresh Codex session. Continue the conversation inside its thread. Existing threads
+After restarting SEELE, mention SEELE in that text channel to open a new thread with a fresh
+Codex session. Only configured owners can start chats. Continue the conversation inside its thread.
+Follow-up messages there continue the session without requiring another mention. Existing threads
 under that channel also use Codex, and you can configure a thread ID directly for a dedicated chat.
 Messages sent during a run are queued for the next turn. Use `/status` to see the session and
 settings, `/new` to reset the session in a thread, and `/cd` to change folders. New threads inherit
