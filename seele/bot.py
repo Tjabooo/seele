@@ -376,7 +376,7 @@ class Seele(discord.Client):
         host = self.cfg.host(self.state.get(key).host) if key else self.cfg.host()
         lines, problem = [], ""
         for att in msg.attachments:
-            name = f"{msg.id}-{Path(att.filename).name}"
+            name = f"{att.id}-{Path(att.filename).name}"  # att.id: Discord names every paste image.png
             path = folder / name
             await att.save(path)
             where = str(path)
