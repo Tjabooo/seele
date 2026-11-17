@@ -273,6 +273,30 @@ def history(cfg: config.Config, args, *, opener=None) -> int:
         return 1
 
 
+def single_instance(path: Path):
+    """Hold an exclusive lock on PATH for the life of the process, or return None if another
+    bot holds it. Two bots on one token answer every message twice (11-17: an orphaned old bot
+    on Windows kept running next to the new one and resumed the channel's old session)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    f.seek(0)
+    f.truncate()
+    f.write(f"{os.getpid()}\n")
+    f.flush()
+    return f
+
+
 def main(argv: list[str]) -> int:
     ensure_path()
     if argv and argv[0] in ("-h", "--help", "help"):
@@ -394,6 +418,12 @@ def main(argv: list[str]) -> int:
                                     level=logging.INFO)
     else:
         discord.utils.setup_logging(level=logging.INFO)
+    lock = single_instance(config.STATE_PATH.parent / "bot.lock")
+    if lock is None:
+        logging.getLogger("seele").error(
+            "another seele bot is already running (%s is locked); not starting a second one",
+            config.STATE_PATH.parent / "bot.lock")
+        return 3
     for content in (True, False):
         bot = Seele(cfg, config.State(), message_content=content)
         try:

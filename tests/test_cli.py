@@ -209,3 +209,15 @@ def test_open_dm_and_user_lookup():
     assert cfg.user_id("123") == 123
     with pytest.raises(ValueError, match="names in \\[people\\]: Oliver, ebi"):
         cfg.user_id("nobody")
+
+
+def test_single_instance_lock(tmp_path):
+    from seele.__main__ import single_instance
+    path = tmp_path / "bot.lock"
+    first = single_instance(path)
+    assert first is not None
+    assert single_instance(path) is None  # a second bot is refused
+    first.close()
+    again = single_instance(path)
+    assert again is not None
+    again.close()

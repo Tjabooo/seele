@@ -43,6 +43,11 @@ $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -Ru
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
 Stop-ScheduledTask -TaskName "SEELE" -ErrorAction SilentlyContinue
+# Stopping the task kills only its cmd loop: the venv's python launcher and the bot under it
+# survive and keep answering next to the new bot (every message handled twice). Kill them too.
+Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
+    Where-Object { $_.CommandLine -match '-m seele run' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Register-ScheduledTask -TaskName "SEELE" -Action $action -Trigger $trigger -Principal $principal `
     -Settings $settings -Description "seele: prompt Claude Code from Discord" -Force | Out-Null
 
