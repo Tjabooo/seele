@@ -334,10 +334,15 @@ class Seele(discord.Client):
         if msg.author.bot or not self.is_owner_id(msg.author.id):
             return
         channel = msg.channel
-        mentioned = self.user in msg.mentions
+        # Typing @SEELE often picks the bot's own role (same name) instead of the bot user: count both.
+        role = msg.guild.self_role if msg.guild else None
+        mentioned = self.user in msg.mentions or (role is not None and role in msg.role_mentions)
         content = msg.content
         if self.user:
-            content = content.replace(f"<@{self.user.id}>", "").replace(f"<@!{self.user.id}>", "").strip()
+            content = content.replace(f"<@{self.user.id}>", "").replace(f"<@!{self.user.id}>", "")
+        if role is not None:
+            content = content.replace(f"<@&{role.id}>", "")
+        content = content.strip()
 
         if isinstance(channel, discord.DMChannel):
             key = channel.id
