@@ -228,7 +228,7 @@ class Conversation:
     listen: bool = False  # server channels: answer every message, not only mentions
     last_prompt: str = ""
     agents_channel: str = ""  # channel id for subagent cards; empty = list them in the status
-    autoresume: bool = False  # after a usage limit or an outage, prompt again once it has passed
+    autoresume: bool = True  # after a usage limit or an outage, prompt again once it has passed (/autoresume off to stop)
     resume_at: float = 0.0  # epoch seconds: the pending auto-resume goes out no earlier (0 = no time set)
     resume_guessed: bool = False  # resume_at is a guess (the reset time was unknown)
     # background agents a limit or an outage stopped, named in the next auto-resume prompt:

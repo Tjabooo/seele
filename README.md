@@ -40,7 +40,7 @@ seele ▸ ✅ Done · 1:07 · 9 tools · 5 h 13% · `3f2a91c0`
   background agent gets a live card there (status, elapsed, tools, tokens, what it's doing, a link
   back) with a thread holding its prompt, its steps and its final report. Without one, running
   agents are listed in the live status.
-- **Auto-resume.** With `/autoresume on`, a run stopped by a usage limit (5-hour or weekly) is
+- **Auto-resume** (on by default; `/autoresume on:False` turns it off per chat). A run stopped by a usage limit (5-hour or weekly) is
   picked up again 5 minutes after the limit resets. Background agents count too: when one fails
   on the limit (even while the run itself goes on, or after it has exited), the resume is scheduled
   and its prompt names every stopped agent by id, so Claude can continue each one with
@@ -132,7 +132,7 @@ Just write to it. Everything else is slash commands:
 | `/sessions` | Pick a recent session in this folder to continue |
 | `/stop` | Stop the running prompt, drop queued messages and any scheduled auto-resume |
 | `/agents [channel]` | Post a live card per background agent in that channel (empty = list them in the status) |
-| `/autoresume on` | After a usage limit, a network outage or API errors, carry on automatically once it's over |
+| `/autoresume on` | After a usage limit, a network outage or API errors, carry on automatically once it's over (default on; `on:False` turns it off) |
 | `/get path` | Upload a file from the machine |
 | `/listen on` | In a server channel: every message becomes a prompt (needs Message Content Intent) |
 
