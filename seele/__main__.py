@@ -223,16 +223,28 @@ def usage_report(cfg: config.Config, only: str | None, as_json: bool) -> int:
               file=sys.stderr)
         return 2
 
+    plan = [a for a in accounts if not a.api]
+
     async def gather():
         return await asyncio.gather(*[usage.account_windows(cfg.claude_bin, a.config_dir, config.account_env(cfg, a))
-                                      for a in accounts])
-    found = dict(zip((a.name for a in accounts), asyncio.run(gather())))
+                                      for a in plan])
+    found = dict(zip((a.name for a in plan), asyncio.run(gather()))) if plan else {}
+    if len(plan) < len(accounts):
+        state = config.State()
+        for a in accounts:
+            if a.api:
+                spent = a.spent + state.spent(a.name)
+                found[a.name] = {"billing": "api", "spent_usd": round(spent, 4), "budget_usd": a.budget}
     if as_json:
         print(json.dumps(found, indent=1))
     else:
         for name, info in found.items():
             if "error" in info:
                 print(f"{name}: {info['error']}")
+                continue
+            if info.get("billing") == "api":
+                from . import credit
+                print(f"{name}: {credit.summary(info['budget_usd'], info['spent_usd'])} (tracked by SEELE)")
                 continue
             parts = []
             for key, label in (("five_hour", "5 h"), ("seven_day", "week")):

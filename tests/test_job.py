@@ -884,3 +884,56 @@ def test_thread_light_follows_the_prompt(bot):
     asyncio.run(go())
     assert th.names == ["🟠 hello", "🟢 hello"]
     assert b.state.get(1).light == "🟢"
+
+
+def api_bot(bot, budget=1.0):
+    b, fake = bot
+    b.cfg.accounts.append(config.Account("api", fake.parent / "c", billing="api", budget=budget, max_run_usd=5))
+    return b, fake
+
+
+def test_api_account_counts_spend_and_caps_runs(bot):
+    b, fake = api_bot(bot)
+    ch = Channel(3)
+    b.state.get(3).account = "api"
+
+    async def go():
+        b.submit(3, ch, "first")
+        await until(lambda: not b.jobs)
+        b.submit(3, ch, "second")
+        await until(lambda: not b.jobs and len(calls(fake)) == 2)
+    asyncio.run(go())
+    argv = calls(fake)[0]["argv"]
+    assert argv[argv.index("--max-budget-usd") + 1] == "1"  # what's left of the budget, under max_run_usd
+    assert b.state.spent("api") == pytest.approx(0.02)
+    assert b.state.spend["api"]["runs"] == 2
+    done = [m.content for m in ch.sent if m.content and m.content.startswith("✅ **Done**")]
+    assert "💳 $0.01 · $0.02 of $1.00 API credit" in done[-1]
+    assert "5 h" not in done[-1]
+    assert config.State(b.state.path).spent("api") == pytest.approx(0.02)  # saved
+
+
+def test_api_account_stops_at_budget(bot):
+    b, fake = api_bot(bot, budget=0.5)
+    b.state.add_spend("api", 0.5, run=True)
+    ch = Channel(4)
+    b.state.get(4).account = "api"
+
+    async def go():
+        b.submit(4, ch, "too much")
+        await until(lambda: not b.jobs)
+    asyncio.run(go())
+    assert calls(fake) == []
+    assert any(m.content and m.content.startswith("💳 **api** has used its $0.50 API budget") for m in ch.sent)
+
+
+def test_plan_account_keeps_plan_stats(bot):
+    b, fake = bot
+    ch = Channel(5)
+
+    async def go():
+        b.submit(5, ch, "plain")
+        await until(lambda: not b.jobs)
+    asyncio.run(go())
+    assert "--max-budget-usd" not in calls(fake)[0]["argv"]
+    assert b.state.spend == {}

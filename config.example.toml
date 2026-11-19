@@ -46,6 +46,15 @@ config_dir = "~/.claude"
 # paths = ["~/Projects/some-project"]
 # effort = "xhigh"           # default effort for this account (a conversation's /effort wins)
 
+# An account that pays from API credit (Console login or API key) instead of a plan: no 5-hour or weekly
+# limits, so /usage shows what SEELE counted it spending against `budget`, and runs stop there.
+# [accounts.claude-api]
+# config_dir = "~/.claude-api"
+# billing = "api"
+# budget = 200               # USD of credit (0 = no budget, just count)
+# max_run_usd = 40           # --max-budget-usd per Claude Code process (0 = only the budget)
+# spent = 0                  # spend from before SEELE counted, to start the total from
+
 # Machines that run Claude Code. Without [hosts] everything runs on this machine. With them, each
 # conversation picks one with /host (new ones use default_host); prompts go there over SSH (key
 # login, ~/.ssh/config aliases) and a machine with a `mac` is woken with Wake-on-LAN first.

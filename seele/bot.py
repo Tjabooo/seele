@@ -17,7 +17,7 @@ from pathlib import Path
 import discord
 from discord import app_commands
 
-from . import agents, claude, config, lights, net, usage
+from . import agents, claude, config, credit, lights, net, usage
 from .hosts import Host, HostError
 from .config import (SPEAKER_NOTE, Config, Conversation, State, apply_effort, default_effort, effort_in,
                      set_default_effort,
@@ -76,6 +76,11 @@ class Job:
     limit_reset: float | None = None  # when a rejected rate limit lifts (epoch seconds)
     tracker: agents.Tracker | None = None
     resume_failed: bool = False
+    account: str = ""
+    api: bool = False  # the account pays from API credit: count what the run costs
+    meter: credit.Meter = field(default_factory=credit.Meter)
+    cost: float = 0.0  # API spend of this run
+    billed: bool = False  # counted as a run in the account's spend
 
 
 class StopView(discord.ui.View):
@@ -510,6 +515,9 @@ class Seele(discord.Client):
         return usage.token_from_text(text)
 
     async def usage_text(self, account) -> str:
+        if account.api:
+            return credit.usage_text(account.budget, self.api_spent(account),
+                                     int((self.state.spend.get(account.name) or {}).get("runs") or 0))
         host = self.usage_host(account)
         token = await self.account_token(account)
         if host.local:
@@ -598,12 +606,22 @@ class Seele(discord.Client):
         if guard and self.cfg.guard_note:
             system += "\n\n" + self.cfg.guard_note
         live = self.cfg.live_input
+        cap = None
+        if account.api:
+            spent = self.api_spent(account)
+            if account.budget > 0 and spent >= account.budget:
+                await channel.send(f"💳 **{account.name}** has used its {credit.money(account.budget)} API budget "
+                                   f"({credit.money(spent)} tracked). Raise `budget` in the SEELE config or switch "
+                                   "with `/account`.")
+                return False
+            cap = credit.run_cap(account.budget, spent, account.max_run_usd)
         argv = claude.build_argv(host.claude_bin or self.cfg.claude_bin, session_id=conv.session_id or None, model=model or None,
-                                 effort=effort or None, mode=mode, system_prompt=system, live=live)
-        job = Job(channel, prompt, key=key)
+                                 effort=effort or None, mode=mode, system_prompt=system, live=live, max_budget=cap)
+        job = Job(channel, prompt, key=key, account=account.name, api=account.api)
         job.meta = " · ".join(filter(None, [
             host.name if len(self.cfg.hosts) > 1 else "", host.short(cwd), account.name, model or "default model",
             f"effort {effort or await self.saved_effort(host) or 'default'}", mode,
+            f"💳 API credit (cap {credit.money(cap)})" if cap else ("💳 API credit" if account.api else ""),
             "🎮 guard on" if guard else ""]))
         job.tracker = agents.Tracker(
             self.board, key, conv, getattr(channel, "jump_url", "") or "",
@@ -679,10 +697,30 @@ class Seele(discord.Client):
                 job.resume_failed = True
                 return
             job.last_result = ev
+            if job.api:
+                await self.bill(job, ev, account)
             await self.on_result(key, job, ev, account)
         if len(job.log) > 200:
             del job.log[:-50]
         job.dirty = True
+
+    def api_spent(self, account) -> float:
+        return account.spent + self.state.spent(account.name)
+
+    async def bill(self, job: Job, result: claude.Event, account):
+        """Add what this turn cost to the API account's total; say so when it crosses 50/80/90 %."""
+        new = job.meter.add(result.cost)
+        if not new and job.billed:
+            return
+        before = self.api_spent(account)
+        self.state.add_spend(account.name, new, run=not job.billed)
+        job.billed = True
+        job.cost += new
+        self.state.save()
+        share = credit.crossed(account.budget, before, before + new)
+        if share:
+            await self.say(job.channel, f"-# 💳 **{account.name}** has used {share:.0%} of its API credit: "
+                                        f"{credit.summary(account.budget, before + new)}.")
 
     async def on_result(self, key: int, job: Job, result: claude.Event, account):
         """Each turn's answer goes out as soon as it arrives; the live status then moves below it
@@ -703,6 +741,12 @@ class Seele(discord.Client):
             conv.resume_sent = []
             self.state.save()
         view = None
+        if result.is_error and account.api and result.data.get("subtype") == "error_max_budget_usd":
+            await self.say(job.channel, "-# 💳 Stopped at this run's API spend cap "
+                                        f"({credit.summary(account.budget, self.api_spent(account))}).")
+        elif result.is_error and account.api and credit.OUT_OF_CREDIT_RE.search(result.text or ""):
+            await self.say(job.channel, f"-# 💳 **{account.name}**'s API credit looks used up: top up at "
+                                        "console.anthropic.com or switch with `/account`.")
         if kind == "limit":
             others = [a.name for a in self.cfg.accounts if a.name != account.name]
             if others:
@@ -797,8 +841,12 @@ class Seele(discord.Client):
         stats = f"{elapsed} · {job.tools} tool{'s' * (job.tools != 1)}"
         if job.results > 1:
             stats += f" · {job.results} replies"
-        if job.utilization is not None:
+        if job.utilization is not None and not job.api:
             stats += f" · 5 h {job.utilization * 100:.0f}%"
+        if job.api:
+            acc = next((a for a in self.cfg.accounts if a.name == job.account), None)
+            total = self.api_spent(acc) if acc else self.state.spent(job.account)
+            stats += f" · 💳 {credit.money(job.cost)} · {credit.summary(acc.budget if acc else 0, total)}"
         if conv.session_id:
             stats += f" · `{conv.session_id[:8]}`"
         result = job.last_result or claude.Event("result", text="No result.", is_error=True)

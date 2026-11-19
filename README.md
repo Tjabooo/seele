@@ -66,6 +66,9 @@ seele ▸ ✅ Done · 1:07 · 9 tools · 5 h 13% · `3f2a91c0`
   `everywhere:True`), `/model`, `/mode` (permission mode), `/account`, `/cd`, `/new`.
 - **Several accounts.** Map folders to Claude accounts (`CLAUDE_CONFIG_DIR`), each with its own
   default effort. When one hits its limit, the reply comes with a **Retry on …** button.
+- **API credit accounts.** `billing = "api"` marks an account that pays per token (Console login or
+  API key). SEELE adds up what each run reports, shows it under every reply and in `/usage` against a
+  `budget`, warns at 50/80/90 %, caps each run with `--max-budget-usd` and stops at the budget.
 - **Attachments.** Files and screenshots you send are saved locally and handed to Claude by path.
   `/get path` uploads a file back.
 - **Guard process.** While a given process runs (say, a game), Claude is told to keep it light.
@@ -255,7 +258,9 @@ piped into `python3 -` on that machine.
 
 `/usage` reads the account's OAuth token from `.credentials.json` and asks the same endpoint
 Claude Code's `/usage` uses; if the token has expired it runs `claude -p /usage` instead, which
-refreshes the login.
+refreshes the login. API-billed accounts have no such limits: SEELE sums each run's `total_cost_usd`
+(a running total per process, so only its growth counts) in `state.json`. Runs made outside SEELE
+aren't counted; the Console's billing page is the real balance.
 
 ## Security
 

@@ -47,6 +47,14 @@ class Account:
     config_dir_raw: str = ""  # as written in the config (~ unexpanded): for other hosts
     paths_raw: list[str] = field(default_factory=list)
     usage_host: str = ""  # host whose login /usage reads (empty: here if logged in, else the default host)
+    billing: str = "plan"  # "plan" (subscription limits) or "api" (pays per token from API credit, see credit.py)
+    budget: float = 0.0  # api: USD of credit to show spend against and to stop at (0 = no budget)
+    max_run_usd: float = 0.0  # api: --max-budget-usd cap per Claude Code process (0 = only the budget)
+    spent: float = 0.0  # api: spend before SEELE started counting (corrects the tracked total)
+
+    @property
+    def api(self) -> bool:
+        return self.billing == "api"
 
     def config_dir_on(self, host: Host) -> str:
         return str(self.config_dir) if host.local else host.path(self.config_dir_raw or "~/.claude")
@@ -185,7 +193,9 @@ def load(path: Path = CONFIG_PATH) -> Config:
         cfg.accounts.append(Account(name, _path(acc.get("config_dir", "~/.claude")),
                                     [_path(p).resolve() for p in acc.get("paths", [])],
                                     acc.get("effort", ""), acc.get("config_dir", "~/.claude"),
-                                    [str(p) for p in acc.get("paths", [])], acc.get("usage_host", "")))
+                                    [str(p) for p in acc.get("paths", [])], acc.get("usage_host", ""),
+                                    str(acc.get("billing", "plan")), float(acc.get("budget", 0)),
+                                    float(acc.get("max_run_usd", 0)), float(acc.get("spent", 0))))
     if not cfg.accounts:
         default = os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")
         cfg.accounts.append(Account("claude", _path(default)))
@@ -255,6 +265,7 @@ class State:
         self.path = path
         self.convs: dict[str, Conversation] = {}
         self.agents: dict[str, dict] = {}  # task id -> agent card (see agents.Card)
+        self.spend: dict[str, dict] = {}  # API-billed account -> {"usd": tracked spend, "runs": n}
         if path.exists():
             try:
                 raw = json.loads(path.read_text())
@@ -262,6 +273,7 @@ class State:
                 for key, val in raw.get("conversations", {}).items():
                     self.convs[key] = Conversation(**{k: v for k, v in val.items() if k in fields})
                 self.agents = {str(k): v for k, v in (raw.get("agents") or {}).items() if isinstance(v, dict)}
+                self.spend = {str(k): v for k, v in (raw.get("spend") or {}).items() if isinstance(v, dict)}
             except (OSError, json.JSONDecodeError, TypeError, AttributeError):
                 pass
 
@@ -271,6 +283,14 @@ class State:
     def has(self, channel_id: int) -> bool:
         return str(channel_id) in self.convs
 
+    def spent(self, account: str) -> float:
+        return float((self.spend.get(account) or {}).get("usd") or 0)
+
+    def add_spend(self, account: str, usd: float, run: bool = False):
+        entry = self.spend.setdefault(account, {"usd": 0.0, "runs": 0})
+        entry["usd"] = round(float(entry.get("usd") or 0) + usd, 6)
+        entry["runs"] = int(entry.get("runs") or 0) + (1 if run else 0)
+
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if len(self.agents) > MAX_AGENT_CARDS:
@@ -278,7 +298,7 @@ class State:
             self.agents = dict(keep)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps({"conversations": {k: asdict(v) for k, v in self.convs.items()},
-                                   "agents": self.agents}, indent=1))
+                                   "agents": self.agents, "spend": self.spend}, indent=1))
         tmp.replace(self.path)
 
 

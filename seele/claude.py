@@ -38,7 +38,8 @@ class Event:
 
 def build_argv(binary: str, *, session_id: str | None = None, model: str | None = None,
                effort: str | None = None, mode: str = "auto", system_prompt: str = "",
-               disallowed: tuple[str, ...] = ("AskUserQuestion",), live: bool = False) -> list[str]:
+               disallowed: tuple[str, ...] = ("AskUserQuestion",), live: bool = False,
+               max_budget: float | None = None) -> list[str]:
     """Command line for one headless run. The prompt goes in on stdin: plain text, or with
     `live` as stream-json user messages (stdin stays open, so more can follow)."""
     argv = [binary, "-p", "--output-format", "stream-json", "--verbose",
@@ -51,6 +52,8 @@ def build_argv(binary: str, *, session_id: str | None = None, model: str | None 
         argv += ["--model", model]
     if effort:
         argv += ["--effort", effort]
+    if max_budget:
+        argv += ["--max-budget-usd", f"{max_budget:g}"]
     if system_prompt:
         argv += ["--append-system-prompt", system_prompt]
     if disallowed:
