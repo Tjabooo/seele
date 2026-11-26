@@ -25,6 +25,10 @@ MODEL_HINTS = ["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6.1-terra", "
 def build_argv(binary: str, *, session_id: str, model: str, effort: str, system_prompt: str,
                sandbox: str = SANDBOX) -> list[str]:
     argv = [binary, "exec"]
+    if sandbox == SANDBOX:
+        argv.append("--approve-for-me")
+    else:
+        argv += ["-c", f"sandbox_mode={json.dumps(sandbox)}", "-c", "approval_policy=never"]
     if session_id:
         argv.append("resume")
     argv += ["--json", "--skip-git-repo-check"]
@@ -32,11 +36,7 @@ def build_argv(binary: str, *, session_id: str, model: str, effort: str, system_
         argv += ["--model", model]
     if effort:
         argv += ["-c", f"model_reasoning_effort={json.dumps(effort)}"]
-    argv += [
-        "-c", f"sandbox_mode={json.dumps(sandbox)}",
-        "-c", "approval_policy=never",
-        "-c", f"developer_instructions={json.dumps(system_prompt, ensure_ascii=False)}",
-    ]
+    argv += ["-c", f"developer_instructions={json.dumps(system_prompt, ensure_ascii=False)}"]
     if session_id:
         argv += ["--", session_id]
     return [*argv, "-"]

@@ -142,6 +142,7 @@ machines. `/model` suggests the models the Codex CLI on that machine offers (its
 danger-full-access, and `/sessions` lists Codex sessions started in the folder, terminal ones too.
 New threads inherit their channel's settings. The starting folder is `default_cwd`, which defaults
 to your home directory. Codex uses `[codex] sandbox` (workspace-write) and the CLI's saved sign-in.
+Workspace-write chats use the CLI's `--approve-for-me` flag to review approval requests automatically.
 `/usage` reads the Codex rate limits on the conversation's host. From other chats, it checks the
 hosts configured for Codex channels. Usage checks only contact machines that are already online.
 

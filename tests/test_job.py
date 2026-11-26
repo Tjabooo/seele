@@ -320,12 +320,12 @@ def test_codex_thread_queues_and_resumes(bot, tmp_path, monkeypatch, configured_
 import json, sys
 args = sys.argv[1:]
 prompt = sys.stdin.read()
-assert args[0] == "exec"
+assert args[:2] == ["exec", "--approve-for-me"]
 assert args[args.index("--model") + 1] == "gpt-6.1-sol"
 assert 'model_reasoning_effort="xhigh"' in args
 assert args[-1] == "-"
 if prompt.endswith("again"):
-    assert args[1] == "resume" and args[-2] == "codex-session"
+    assert args[2] == "resume" and args[-2] == "codex-session"
 else:
     assert "resume" not in args
 for event in [
