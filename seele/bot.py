@@ -586,6 +586,31 @@ class Seele(discord.Client):
             return out.decode(errors="replace").replace("SEELE_PID", "").strip()
         return await usage.for_account(self.cfg.claude_bin, account.config_dir, {}, token=token, cli=cli)
 
+    def codex_usage_hosts(self, channel) -> list[Host]:
+        ids = sorted(self.cfg.codex.channels)
+        if self.is_codex(channel):
+            key = channel.id
+            if not self.state.has(key):
+                key = getattr(channel, "parent_id", None) or key
+            ids = [key]
+        hosts = {}
+        for key in ids:
+            conv = self.state.convs.get(str(key))
+            host = self.cfg.host(conv.host if conv else "")
+            hosts[host.name] = host
+        return list(hosts.values())
+
+    async def codex_usage_text(self, host: Host) -> str:
+        argv, env, cwd = host.command([self.cfg.codex.binary, "app-server"],
+                                      cwd=host.path("~") if host.local else host.home or ".", env=self.cfg.env)
+        try:
+            limits = await codex.read_rate_limits(argv, env, cwd)
+        except TimeoutError:
+            return "Timed out reading Codex usage."
+        except (OSError, RuntimeError, ValueError):
+            return "Usage unavailable. Check that this host is reachable and Codex is signed in."
+        return usage.format_codex(limits)
+
     async def run_job(self, key: int, channel, prompt: str, *, human: bool = True, new_session: bool = False):
         crashed = False
         self.mark(key, channel, lights.BUSY)
@@ -1486,15 +1511,18 @@ def register_commands(bot: Seele):
         return [app_commands.Choice(name=n, value=n) for n in ["auto", *[a.name for a in bot.cfg.accounts]]
                 if current.lower() in n.lower()]
 
-    @command("usage", "Plan usage for every Claude account (like /usage)")
+    @command("usage", "Claude account usage and Codex rate limits")
     async def usage_cmd(interaction: discord.Interaction):
         if not await guard(interaction):
             return
         await interaction.response.defer(thinking=True)
-        embed = discord.Embed(title="Claude usage", color=0xE8590C)
-        results = await asyncio.gather(*[bot.usage_text(a) for a in bot.cfg.accounts])
-        for acc, text in zip(bot.cfg.accounts, results):
-            embed.add_field(name=acc.name, value=text[:1024], inline=False)
+        hosts = bot.codex_usage_hosts(interaction.channel)
+        embed = discord.Embed(title="Claude & Codex usage" if hosts else "Claude usage", color=0xE8590C)
+        names = [a.name for a in bot.cfg.accounts] + [f"Codex · {h.name}" for h in hosts]
+        results = await asyncio.gather(*(bot.usage_text(a) for a in bot.cfg.accounts),
+                                       *(bot.codex_usage_text(h) for h in hosts))
+        for name, text in zip(names, results):
+            embed.add_field(name=name, value=text[:1024], inline=False)
         running = len(bot.jobs)
         embed.set_footer(text=f"{running} prompt{'s' * (running != 1)} running")
         await interaction.followup.send(embed=embed)

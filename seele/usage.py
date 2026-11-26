@@ -1,4 +1,4 @@
-"""Plan usage (the numbers behind Claude Code's /usage) for each configured account."""
+"""Read Claude plan usage and format the usage windows shown in Discord."""
 from __future__ import annotations
 
 import asyncio
@@ -90,13 +90,46 @@ def rows(data: dict) -> list[tuple[str, float, str]]:
     return out
 
 
+def _format_window(label: str, percent: float, reset: str) -> str:
+    line = f"`{bar(percent)}` **{percent:.0f}%** {label}"
+    return f"{line} · {reset}" if reset else line
+
+
 def format_rows(data: dict) -> str:
-    lines = []
-    for label, pct, resets in rows(data):
-        lines.append(f"`{bar(pct)}` **{pct:.0f}%** {label} · {until(resets)}".rstrip(" ·"))
+    lines = [_format_window(label, pct, until(resets)) for label, pct, resets in rows(data)]
     extra = data.get("extra_usage") or {}
     if extra.get("is_enabled") and extra.get("used_credits") is not None:
         lines.append(f"Extra usage: {extra['used_credits']} of {extra.get('monthly_limit')}")
+    return "\n".join(lines) or "No limits reported."
+
+
+def format_codex(data: dict) -> str:
+    """Format the main Codex windows and any model-specific limits."""
+    buckets = {"codex": data.get("rateLimits") or {}}
+    buckets.update(data.get("rateLimitsByLimitId") or {})
+    lines = []
+    for bucket_id, bucket in buckets.items():
+        label = (bucket.get("limitName") or bucket_id) if bucket_id != "codex" else ""
+        for key, fallback in (("primary", "Session"), ("secondary", "Long window")):
+            window = bucket.get(key) or {}
+            percent = window.get("usedPercent")
+            if percent is None:
+                continue
+            mins = window.get("windowDurationMins")
+            name = fallback
+            if mins == 10080:
+                name = "Week"
+            elif mins and mins % 1440 == 0:
+                name = f"{mins // 1440} d"
+            elif mins and mins % 60 == 0:
+                name = f"{mins // 60} h"
+            elif mins:
+                name = f"{mins} min"
+            if label:
+                name = f"{name}, {label}"
+            reset_at = window.get("resetsAt")
+            reset = f"resets <t:{reset_at}:R>" if reset_at else ""
+            lines.append(_format_window(name, percent, reset))
     return "\n".join(lines) or "No limits reported."
 
 

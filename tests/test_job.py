@@ -2,6 +2,7 @@
 import asyncio
 import itertools
 import json
+import os
 import stat
 import sys
 import time
@@ -12,9 +13,10 @@ import pytest
 
 from seele import agents, claude
 from seele import bot as botmod
-from seele import config
+from seele import codex, config, usage
 from seele.__main__ import write_request
 from seele.bot import Seele
+from seele.hosts import Host
 
 FAKE = r'''#!PYTHON
 import json, os, queue, sys, threading, time
@@ -463,6 +465,77 @@ def test_codex_thread_commands_use_inherited_settings(bot, tmp_path, monkeypatch
         assert response.send_message.call_args.args[0] == "This command is for Claude chats."
 
     asyncio.run(go())
+
+
+def test_usage_adds_codex_from_the_chat_host(bot, monkeypatch):
+    b, _ = bot
+    channel = Channel(7)
+    thread = ChatThread(8, channel.id)
+    b.cfg.hosts = {name: Host(name) for name in ("default", "codex-host", "thread-host")}
+    b.cfg.default_host = "default"
+    b.cfg.codex.channels = {channel.id}
+    b.state.get(channel.id).host = "codex-host"
+    b.owners = {42}
+    monkeypatch.setattr(b, "usage_text", AsyncMock(return_value="Claude limits"))
+    get_limits = AsyncMock(return_value={"rateLimits": {
+        "primary": {"usedPercent": 0, "windowDurationMins": 300, "resetsAt": 1800000000},
+        "secondary": {"usedPercent": 50, "windowDurationMins": 10080},
+    }})
+    monkeypatch.setattr(codex, "read_rate_limits", get_limits)
+    send = AsyncMock()
+    interaction = SimpleNamespace(channel=Channel(10), user=SimpleNamespace(id=42),
+                                  response=SimpleNamespace(defer=AsyncMock()), followup=SimpleNamespace(send=send))
+
+    async def go():
+        command = b.tree.get_command("usage")
+        for source, host in ((interaction.channel, "codex-host"), (thread, "codex-host")):
+            interaction.channel = source
+            await command.callback(interaction)
+            embed = send.call_args.kwargs["embed"]
+            assert embed.fields[0].value == "Claude limits"
+            assert embed.fields[-1].name == f"Codex · {host}"
+            assert "**0%** 5 h · resets <t:1800000000:R>" in embed.fields[-1].value
+            assert "**50%** Week" in embed.fields[-1].value
+
+        b.state.get(thread.id).host = "thread-host"
+        get_limits.side_effect = TimeoutError
+        await command.callback(interaction)
+        fields = send.call_args.kwargs["embed"].fields
+        assert fields[-1].name == "Codex · thread-host"
+        assert fields[-1].value == "Timed out reading Codex usage."
+        assert fields[0].value == "Claude limits"
+
+    asyncio.run(go())
+
+
+def test_codex_rate_limits_use_app_server_without_a_turn():
+    server = """
+import json, sys
+
+def receive():
+    return json.loads(sys.stdin.readline())
+
+def send(message):
+    print(json.dumps(message), flush=True)
+
+initialize = receive()
+assert initialize["method"] == "initialize"
+send({"id": initialize["id"], "result": {}})
+assert receive()["method"] == "initialized"
+read = receive()
+assert read["method"] == "account/rateLimits/read"
+send({"method": "account/rateLimits/updated", "params": {}})
+send({"id": read["id"], "result": {
+    "rateLimitsByLimitId": {
+        "codex": {"primary": {"usedPercent": 20, "windowDurationMins": 300}},
+        "codex_model": {"limitName": "Model", "secondary": {"usedPercent": 55, "windowDurationMins": 10080}},
+    },
+}})
+sys.stdin.read()
+"""
+    data = asyncio.run(codex.read_rate_limits([sys.executable, "-c", server], dict(os.environ), None))
+    shown = usage.format_codex(data)
+    assert "**20%** 5 h" in shown and "**55%** Week, Model" in shown
 
 
 def test_plain_stdin_when_live_input_is_off(bot):

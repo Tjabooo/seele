@@ -60,8 +60,8 @@ seele ▸ ✅ Done · 1:07 · 9 tools · 5 h 13% · `3f2a91c0`
 - **Real sessions.** Conversations resume the same Claude Code session, and `/status` prints the
   `claude --resume …` line to carry on in a terminal. `/sessions` goes the other way: continue a
   terminal session from your phone.
-- **Usage.** `/usage` shows the same session/weekly limits as Claude Code's `/usage`, for every
-  account, as bars with reset times. `/cost` runs a spend report command if you have one.
+- **Usage.** `/usage` shows Claude and Codex plan limits as bars with reset times.
+  `/cost` runs a spend report command if you have one.
 - **Settings per conversation:** `/effort` (or save it as Claude Code's default with
   `everywhere:True`), `/model`, `/mode` (permission mode), `/account`, `/cd`, `/new`.
 - **Several accounts.** Map folders to Claude accounts (`CLAUDE_CONFIG_DIR`), each with its own
@@ -142,6 +142,8 @@ machines. `/model` suggests the models the Codex CLI on that machine offers (its
 danger-full-access, and `/sessions` lists Codex sessions started in the folder, terminal ones too.
 New threads inherit their channel's settings. The starting folder is `default_cwd`, which defaults
 to your home directory. Codex uses `[codex] sandbox` (workspace-write) and the CLI's saved sign-in.
+`/usage` reads the Codex rate limits on the conversation's host. From other chats, it checks the
+hosts configured for Codex channels. Usage checks only contact machines that are already online.
 
 ## Usage
 
@@ -155,7 +157,7 @@ Just write to it. Everything else is slash commands:
 | `/model name` | opus, sonnet, haiku, a full model id, or default |
 | `/mode mode` | Permission mode: auto · acceptEdits · plan · bypassPermissions |
 | `/account name` | Which Claude account runs this conversation (or auto, by folder) |
-| `/usage` | Plan limits for every account |
+| `/usage` | Claude account usage and Codex rate limits |
 | `/cost [days]` | Run your spend report command |
 | `/status` | Folder, account, model, effort, session id and the terminal resume line |
 | `/sessions` | Pick a recent session in this folder to continue |

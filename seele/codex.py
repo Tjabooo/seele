@@ -1,10 +1,12 @@
 """Run one Codex turn with the signed-in CLI and translate its JSONL events."""
 from __future__ import annotations
 
+import asyncio
 import json
+from contextlib import suppress
 from pathlib import Path
 
-from . import claude
+from . import __version__, claude
 from .claude import Event
 
 TOOL_LABELS = {
@@ -38,6 +40,46 @@ def build_argv(binary: str, *, session_id: str, model: str, effort: str, system_
     if session_id:
         argv += ["--", session_id]
     return [*argv, "-"]
+
+
+async def read_rate_limits(argv: list[str], env: dict[str, str], cwd: str | None, *, timeout: float = 15) -> dict:
+    """Read account limits from the CLI's stdio app server without starting a turn."""
+    proc = await asyncio.create_subprocess_exec(
+        *argv, env=env, cwd=cwd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+
+    def send(message: dict):
+        proc.stdin.write((json.dumps(message) + "\n").encode())
+
+    async def receive(reply_id: int) -> dict:
+        while line := await proc.stdout.readline():
+            try:
+                answer = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(answer, dict) and answer.get("id") == reply_id:
+                result = answer.get("result")
+                if isinstance(result, dict):
+                    return result
+                break
+        raise RuntimeError("Codex app server did not return a result")
+
+    async def read() -> dict:
+        send({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "seele", "version": __version__}}})
+        await proc.stdin.drain()
+        await receive(1)
+        send({"method": "initialized"})
+        send({"id": 2, "method": "account/rateLimits/read"})
+        await proc.stdin.drain()
+        return await receive(2)
+
+    try:
+        return await asyncio.wait_for(read(), timeout)
+    finally:
+        with suppress(ProcessLookupError):
+            proc.kill()
+        await proc.communicate()
 
 
 class Run(claude.Run):
