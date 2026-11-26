@@ -117,6 +117,29 @@ check all follow it. See `[hosts]` in `config.example.toml`.
   and work anywhere with the token). `install.sh` then installs only the CLI and leaves the
   service off.
 
+### Codex chats
+
+Install the Codex CLI and sign in (`codex login`) on the machines that run the chats (the
+conversation's `/host`, like Claude). Create a Discord text channel
+or thread and add its ID to `[codex].channels` in SEELE's config. Enable Message Content Intent
+so SEELE can read ordinary messages there.
+
+```toml
+[codex]
+channels = [123456789012345678]
+model = "gpt-6.1-sol"
+effort = "xhigh"
+```
+
+After restarting SEELE, mention SEELE in that text channel to open a new thread with a fresh
+Codex session. Only configured owners can start chats. Continue the conversation inside its thread.
+Follow-up messages there continue the session without requiring another mention. Existing threads
+under that channel also use Codex, and you can configure a thread ID directly for a dedicated chat.
+Messages sent during a run are queued for the next turn. Use `/status` to see the session and
+settings, `/new` to reset the session in a thread, and `/cd` to change folders. New threads inherit
+their channel's folder, model and effort. The starting folder is `default_cwd`, which defaults to
+your home directory. Codex runs in the workspace-write sandbox and uses the CLI's saved sign-in.
+
 ## Usage
 
 Just write to it. Everything else is slash commands:

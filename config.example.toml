@@ -36,6 +36,14 @@ live_input = true            # messages sent while Claude works go straight into
 [claude.env]
 # NOTIFY_DONE = "0"
 
+# Opt-in Codex chats. Mentions in listed channels open fresh threads.
+# Follow-ups inside a thread continue its session.
+[codex]
+channels = []                # e.g. ["codex"] when [channels] names that channel
+binary = "codex"
+model = "gpt-6.1-sol"
+effort = "xhigh"
+
 # Claude accounts. The first one is the default; `paths` pick an account by working folder.
 # Leave this out to use whatever `claude` uses.
 [accounts.claude]
@@ -93,6 +101,7 @@ note = "A game is running on this machine right now: avoid heavy local work (bui
 # Names for channels, used by the CLI: `seele post --channel progress`, `seele conv --id lead`,
 # `--agents-channel agents`. Values are channel or thread ids.
 [channels]
+# codex = 123456789012345678
 # lead = 123456789012345678
 # progress = 123456789012345678
 # agents = 123456789012345678
