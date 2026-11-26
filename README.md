@@ -136,9 +136,12 @@ Codex session. Only configured owners can start chats. Continue the conversation
 Follow-up messages there continue the session without requiring another mention. Existing threads
 under that channel also use Codex, and you can configure a thread ID directly for a dedicated chat.
 Messages sent during a run are queued for the next turn. Use `/status` to see the session and
-settings, `/new` to reset the session in a thread, and `/cd` to change folders. New threads inherit
-their channel's folder, model and effort. The starting folder is `default_cwd`, which defaults to
-your home directory. Codex runs in the workspace-write sandbox and uses the CLI's saved sign-in.
+settings, `/new` to reset the session in a thread, `/cd` to change folders and `/host` to change
+machines. `/model` suggests the models the Codex CLI on that machine offers (its `models_cache.json`),
+`/effort` checks the level against the model, `/sandbox` sets read-only, workspace-write or
+danger-full-access, and `/sessions` lists Codex sessions started in the folder, terminal ones too.
+New threads inherit their channel's settings. The starting folder is `default_cwd`, which defaults
+to your home directory. Codex uses `[codex] sandbox` (workspace-write) and the CLI's saved sign-in.
 
 ## Usage
 

@@ -15,6 +15,9 @@ TOOL_LABELS = {
     "collab_tool_call": "Agent tool call",
 }
 SANDBOX = "workspace-write"
+SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
+EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")  # what Codex models take (per-model subsets)
+MODEL_HINTS = ["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-astra", "gpt-6-luna"]
 
 
 def build_argv(binary: str, *, session_id: str, model: str, effort: str, system_prompt: str,

@@ -456,6 +456,21 @@ class Seele(discord.Client):
     def codex_settings(self, conv: Conversation) -> tuple[str, str]:
         return conv.model or self.cfg.codex.model, conv.effort or self.cfg.codex.effort
 
+    def codex_sandbox(self, conv: Conversation) -> str:
+        return conv.mode if conv.mode in codex.SANDBOXES else self.cfg.codex.sandbox
+
+    async def codex_models(self, host: Host) -> list:
+        """[[slug, [efforts], default], ...] the Codex CLI on `host` offers (cached 10 min); [] if unknown."""
+        cache = self.__dict__.setdefault("_codex_models", {})
+        at, models = cache.get(host.name, (0.0, []))
+        if time.monotonic() - at > 600 or not models:
+            try:
+                models = await host.op("codex_models", timeout=10) or []
+            except (HostError, OSError):
+                models = models or []
+            cache[host.name] = (time.monotonic(), models)
+        return models
+
     def settings_for(self, conv: Conversation):
         """(cwd, account, model, effort, mode); cwd is a path on the conversation's host."""
         host = self.host_of(conv)
@@ -622,11 +637,11 @@ class Seele(discord.Client):
             live = False
             cmodel, ceffort = self.codex_settings(conv)
             argv = codex.build_argv(self.cfg.codex.binary, session_id=conv.session_id, model=cmodel,
-                                    effort=ceffort, system_prompt=system, sandbox=self.cfg.codex.sandbox)
+                                    effort=ceffort, system_prompt=system, sandbox=self.codex_sandbox(conv))
             job = Job(channel, prompt, key=key, codex=True)
             job.meta = " · ".join(filter(None, [
                 host.name if len(self.cfg.hosts) > 1 else "", host.short(cwd), "Codex", cmodel or "default model",
-                f"effort {ceffort or 'default'}", self.cfg.codex.sandbox, "🎮 guard on" if guard else ""]))
+                f"effort {ceffort or 'default'}", self.codex_sandbox(conv), "🎮 guard on" if guard else ""]))
             job.tracker = agents.Tracker(self.board, key, conv, getattr(channel, "jump_url", "") or "")
             env, unset = dict(self.cfg.env), ()
         else:
@@ -1331,7 +1346,8 @@ def register_commands(bot: Seele):
 
     @command("effort", "Set the effort level for this conversation, or Claude Code's default")
     @app_commands.describe(level="Effort level", everywhere="Also save it as Claude Code's default (like /effort)")
-    @app_commands.choices(level=[app_commands.Choice(name=x, value=x) for x in (*claude.EFFORTS, "default")])
+    @app_commands.choices(level=[app_commands.Choice(name=x, value=x)
+                                 for x in (*dict.fromkeys((*claude.EFFORTS, *codex.EFFORTS)), "default")])
     async def effort(interaction: discord.Interaction, level: app_commands.Choice[str], everywhere: bool = False):
         if not await guard(interaction):
             return
@@ -1342,6 +1358,17 @@ def register_commands(bot: Seele):
             return await interaction.response.send_message("Use /effort without everywhere for a Codex chat.",
                                                            ephemeral=True)
         await interaction.response.defer()
+        if level.value != "default":
+            if is_codex:
+                cmodel = bot.codex_settings(conv)[0]
+                known = {m[0]: m[1] for m in await bot.codex_models(host)}
+                allowed = known.get(cmodel) or codex.EFFORTS
+                if level.value not in allowed:
+                    return await interaction.followup.send(
+                        f"**{cmodel}** takes {', '.join(allowed)} (not {level.value}).", ephemeral=True)
+            elif level.value not in claude.EFFORTS:
+                return await interaction.followup.send(
+                    f"Claude takes {', '.join(claude.EFFORTS)} (not {level.value}).", ephemeral=True)
         if everywhere and level.value != "default":
             try:
                 models = await bot.save_effort(host, level.value)
@@ -1365,20 +1392,55 @@ def register_commands(bot: Seele):
             return
         conv = await conv_of(interaction)
         conv.model = "" if name == "default" else name.strip()
+        note = ""
+        if bot.is_codex(interaction.channel):
+            known = {m[0]: m for m in await bot.codex_models(bot.host_of(conv))}
+            cmodel = conv.model or bot.cfg.codex.model
+            if known and cmodel not in known:
+                note = f" ⚠️ Not in the Codex CLI's list ({', '.join(known)})."
+            elif conv.effort and cmodel in known and known[cmodel][1] and conv.effort not in known[cmodel][1]:
+                conv.effort = ""  # that model doesn't take the old effort
+                note = f" Effort reset to default ({cmodel} takes {', '.join(known[cmodel][1])})."
+            default = bot.cfg.codex.model or "CLI default"
+        else:
+            default = "default"
         bot.state.save()
-        default = bot.cfg.codex.model if bot.is_codex(interaction.channel) else "default"
-        await interaction.response.send_message(f"🧠 Model here: **{conv.model or default}**.")
+        await interaction.response.send_message(f"🧠 Model here: **{conv.model or default}**.{note}")
 
     @model.autocomplete("name")
     async def model_complete(interaction, current: str):
-        hints = ["default", bot.cfg.codex.model] if bot.is_codex(interaction.channel) else MODEL_HINTS
-        return [app_commands.Choice(name=m, value=m) for m in hints if current.lower() in m][:25]
+        if bot.is_codex(interaction.channel):
+            try:
+                found = await asyncio.wait_for(bot.codex_models(bot.host_of(await conv_of(interaction))), 2.5)
+            except (asyncio.TimeoutError, TimeoutError):
+                found = []
+            hints = ["default", *dict.fromkeys([m[0] for m in found] or codex.MODEL_HINTS)]
+        else:
+            hints = MODEL_HINTS
+        return [app_commands.Choice(name=m, value=m) for m in hints if current.lower() in m.lower()][:25]
+
+    @command("sandbox", "Codex chats: what Codex may touch (read-only, workspace-write, danger-full-access)")
+    @app_commands.choices(level=[app_commands.Choice(name=x, value=x) for x in (*codex.SANDBOXES, "default")])
+    async def sandbox(interaction: discord.Interaction, level: app_commands.Choice[str]):
+        if not await guard(interaction):
+            return
+        if not bot.is_codex(interaction.channel):
+            return await interaction.response.send_message("This command is for Codex chats (Claude: /mode).",
+                                                           ephemeral=True)
+        conv = await conv_of(interaction)
+        conv.mode = "" if level.value == "default" else level.value
+        bot.state.save()
+        shown = bot.codex_sandbox(conv)
+        warn = " ⚠️ No sandbox at all." if shown == "danger-full-access" else ""
+        await interaction.response.send_message(f"🔐 Sandbox here: **{shown}**.{warn}")
 
     @command("mode", "Set the permission mode for this conversation")
     @app_commands.choices(mode=[app_commands.Choice(name=m, value=m) for m in (*claude.MODES, "default")])
     async def mode(interaction: discord.Interaction, mode: app_commands.Choice[str]):
-        if not await guard(interaction, claude_only=True):
+        if not await guard(interaction):
             return
+        if bot.is_codex(interaction.channel):
+            return await interaction.response.send_message("Codex chats use /sandbox instead.", ephemeral=True)
         conv = await conv_of(interaction)
         conv.mode = "" if mode.value == "default" else mode.value
         bot.state.save()
@@ -1465,7 +1527,7 @@ def register_commands(bot: Seele):
         if bot.is_codex(interaction.channel):
             model_, effort_ = bot.codex_settings(conv)
             lines += ["**Backend** Codex", f"**Model** {model_ or 'default'}", f"**Effort** {effort_ or 'default'}",
-                      f"**Sandbox** {bot.cfg.codex.sandbox}"]
+                      f"**Sandbox** {bot.codex_sandbox(conv)}"]
             resume = "codex resume"
         else:
             saved = (await bot.saved_effort(host) if awake else "") or "CLI default"
@@ -1510,9 +1572,9 @@ def register_commands(bot: Seele):
         stopped = bot.stop(interaction.channel_id)
         await interaction.response.send_message("⏹ Stopping." if stopped else "Nothing is running here.")
 
-    @command("sessions", "Continue one of the recent Claude sessions in this folder (also terminal ones)")
+    @command("sessions", "Continue one of the recent sessions in this folder (also terminal ones)")
     async def sessions(interaction: discord.Interaction):
-        if not await guard(interaction, claude_only=True):
+        if not await guard(interaction):
             return
         conv = await conv_of(interaction)
         host = bot.host_of(conv)
@@ -1522,7 +1584,9 @@ def register_commands(bot: Seele):
                 raise HostError(f"{host.name} is asleep or off: its sessions live there.")
             await host.fill_home()
             cwd, acc, *_ = bot.settings_for(conv)
-            if host.local:
+            if bot.is_codex(interaction.channel):
+                found = [tuple(x) for x in await host.op("codex_sessions", cwd, "25")]
+            elif host.local:
                 found = await asyncio.to_thread(claude.recent_sessions, acc.config_dir, Path(cwd), 25)
             else:
                 found = [tuple(x) for x in await host.op("sessions", acc.config_dir_on(host), cwd, "25")]

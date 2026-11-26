@@ -114,7 +114,56 @@ def op_pgrep(name: str) -> bool:
     return subprocess.run(["pgrep", "-x", name], stdout=subprocess.DEVNULL).returncode == 0
 
 
-OPS = {"home": op_home, "isdir": op_isdir, "size": op_size, "dirs": op_dirs, "read": op_read,
+def _codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+
+
+def op_codex_models() -> list:
+    """[[slug, [efforts], default effort], ...] from the Codex CLI's model cache (filled once it's signed in)."""
+    try:
+        data = json.loads((_codex_home() / "models_cache.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    out = []
+    for m in data.get("models", []) if isinstance(data, dict) else []:
+        if not isinstance(m, dict) or not m.get("slug") or m.get("visibility", "list") != "list":
+            continue
+        levels = [e.get("effort") for e in m.get("supported_reasoning_levels", []) if isinstance(e, dict) and e.get("effort")]
+        out.append([m["slug"], levels, m.get("default_reasoning_level") or ""])
+    return out
+
+
+def op_codex_sessions(cwd: str, limit: str = "25") -> list:
+    """Recent Codex sessions started in `cwd`: [[id, title, mtime], ...], newest first."""
+    home = _codex_home()
+    titles = {}
+    try:
+        for line in (home / "session_index.jsonl").read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+                titles[row["id"]] = row.get("thread_name") or ""
+            except (ValueError, KeyError, TypeError):
+                continue
+    except OSError:
+        pass
+    want = os.path.normcase(os.path.realpath(str(_expand(cwd))))
+    files = sorted((home / "sessions").glob("*/*/*/rollout-*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
+    found = []
+    for f in files[:400]:
+        try:
+            with f.open(encoding="utf-8") as fh:
+                meta = json.loads(fh.readline()).get("payload") or {}
+        except (OSError, ValueError, AttributeError):
+            continue
+        sid, where = meta.get("id"), meta.get("cwd") or ""
+        if sid and where and os.path.normcase(os.path.realpath(where)) == want:
+            found.append([sid, _clip(titles.get(sid, "")), f.stat().st_mtime])
+            if len(found) >= int(limit):
+                break
+    return found
+
+
+OPS = {"home": op_home, "codex_models": op_codex_models, "codex_sessions": op_codex_sessions, "isdir": op_isdir, "size": op_size, "dirs": op_dirs, "read": op_read,
        "sessions": op_sessions, "pgrep": op_pgrep,
        "realpath": op_realpath, "rename": op_rename}
 
