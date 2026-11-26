@@ -247,6 +247,8 @@ class Seele(discord.Client):
         self.api_every = API_EVERY
         self.backoff = RETRY_BACKOFF
         self.lights = lights.Lights()  # 🟠/🟢/🔴 in front of thread names
+        self._codex_models: dict[str, tuple[float, list]] = {}  # host name -> (when, models)
+        self._codex_refreshing: set[str] = set()
         register_commands(self)
 
     # ---------- setup ----------
@@ -258,6 +260,9 @@ class Seele(discord.Client):
         await self.tree.sync()
         self.spawn(self.poll_forever())
         self.spawn(self.watch_api_forever())
+        for cid in self.cfg.codex.channels:  # warm the /model list for the Codex channels' machines
+            if self.state.has(cid):
+                self.cached_codex_models(self.host_of(self.state.get(cid)))
 
     async def on_ready(self):
         if not self.owners:
@@ -461,14 +466,29 @@ class Seele(discord.Client):
 
     async def codex_models(self, host: Host) -> list:
         """[[slug, [efforts], default], ...] the Codex CLI on `host` offers (cached 10 min); [] if unknown."""
-        cache = self.__dict__.setdefault("_codex_models", {})
-        at, models = cache.get(host.name, (0.0, []))
+        at, models = self._codex_models.get(host.name, (0.0, []))
         if time.monotonic() - at > 600 or not models:
             try:
                 models = await host.op("codex_models", timeout=10) or []
             except (HostError, OSError):
                 models = models or []
-            cache[host.name] = (time.monotonic(), models)
+            self._codex_models[host.name] = (time.monotonic(), models)
+        return models
+
+    def cached_codex_models(self, host: Host) -> list:
+        """What's known right now (autocomplete has 3 s, an SSH look-up from Windows can take longer);
+        a stale or missing entry is refreshed in the background for the next keystroke."""
+        at, models = self._codex_models.get(host.name, (0.0, []))
+        if time.monotonic() - at > 600 or not models:
+            if host.name not in self._codex_refreshing:
+                self._codex_refreshing.add(host.name)
+
+                async def refresh():
+                    try:
+                        await self.codex_models(host)
+                    finally:
+                        self._codex_refreshing.discard(host.name)
+                self.spawn(refresh())
         return models
 
     def settings_for(self, conv: Conversation):
@@ -1410,10 +1430,9 @@ def register_commands(bot: Seele):
     @model.autocomplete("name")
     async def model_complete(interaction, current: str):
         if bot.is_codex(interaction.channel):
-            try:
-                found = await asyncio.wait_for(bot.codex_models(bot.host_of(await conv_of(interaction))), 2.5)
-            except (asyncio.TimeoutError, TimeoutError):
-                found = []
+            key = next((k for k in (interaction.channel_id, getattr(interaction.channel, "parent_id", None))
+                        if k and bot.state.has(k)), None)  # no state.get here: it would create a conversation
+            found = bot.cached_codex_models(bot.host_of(bot.state.get(key)) if key else bot.cfg.host())
             hints = ["default", *dict.fromkeys([m[0] for m in found] or codex.MODEL_HINTS)]
         else:
             hints = MODEL_HINTS
