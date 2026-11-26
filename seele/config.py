@@ -71,6 +71,7 @@ class CodexConfig:
     binary: str = "codex"
     model: str = "gpt-6.1-sol"
     effort: str = "xhigh"
+    sandbox: str = "workspace-write"  # codex sandbox_mode (read-only, workspace-write, danger-full-access)
     channels: set[int] = field(default_factory=set)
 
 
@@ -202,6 +203,7 @@ def load(path: Path = CONFIG_PATH) -> Config:
         binary=codex.get("binary", cfg.codex.binary),
         model=codex.get("model", cfg.codex.model),
         effort=codex.get("effort", cfg.codex.effort),
+        sandbox=codex.get("sandbox", cfg.codex.sandbox),
         channels={cfg.channel_id(ch) for ch in codex.get("channels", [])},
     )
     cfg.live_input = bool(c.get("live_input", cfg.live_input))

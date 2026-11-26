@@ -17,7 +17,8 @@ TOOL_LABELS = {
 SANDBOX = "workspace-write"
 
 
-def build_argv(binary: str, *, session_id: str, model: str, effort: str, system_prompt: str) -> list[str]:
+def build_argv(binary: str, *, session_id: str, model: str, effort: str, system_prompt: str,
+               sandbox: str = SANDBOX) -> list[str]:
     argv = [binary, "exec"]
     if session_id:
         argv.append("resume")
@@ -27,7 +28,7 @@ def build_argv(binary: str, *, session_id: str, model: str, effort: str, system_
     if effort:
         argv += ["-c", f"model_reasoning_effort={json.dumps(effort)}"]
     argv += [
-        "-c", f"sandbox_mode={json.dumps(SANDBOX)}",
+        "-c", f"sandbox_mode={json.dumps(sandbox)}",
         "-c", "approval_policy=never",
         "-c", f"developer_instructions={json.dumps(system_prompt, ensure_ascii=False)}",
     ]

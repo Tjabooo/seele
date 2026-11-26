@@ -43,6 +43,7 @@ channels = []                # e.g. ["codex"] when [channels] names that channel
 binary = "codex"
 model = "gpt-6.1-sol"
 effort = "xhigh"
+sandbox = "workspace-write"  # or read-only / danger-full-access
 
 # Claude accounts. The first one is the default; `paths` pick an account by working folder.
 # Leave this out to use whatever `claude` uses.

@@ -622,11 +622,11 @@ class Seele(discord.Client):
             live = False
             cmodel, ceffort = self.codex_settings(conv)
             argv = codex.build_argv(self.cfg.codex.binary, session_id=conv.session_id, model=cmodel,
-                                    effort=ceffort, system_prompt=system)
+                                    effort=ceffort, system_prompt=system, sandbox=self.cfg.codex.sandbox)
             job = Job(channel, prompt, key=key, codex=True)
             job.meta = " · ".join(filter(None, [
                 host.name if len(self.cfg.hosts) > 1 else "", host.short(cwd), "Codex", cmodel or "default model",
-                f"effort {ceffort or 'default'}", codex.SANDBOX, "🎮 guard on" if guard else ""]))
+                f"effort {ceffort or 'default'}", self.cfg.codex.sandbox, "🎮 guard on" if guard else ""]))
             job.tracker = agents.Tracker(self.board, key, conv, getattr(channel, "jump_url", "") or "")
             env, unset = dict(self.cfg.env), ()
         else:
@@ -1465,7 +1465,7 @@ def register_commands(bot: Seele):
         if bot.is_codex(interaction.channel):
             model_, effort_ = bot.codex_settings(conv)
             lines += ["**Backend** Codex", f"**Model** {model_ or 'default'}", f"**Effort** {effort_ or 'default'}",
-                      f"**Sandbox** {codex.SANDBOX}"]
+                      f"**Sandbox** {bot.cfg.codex.sandbox}"]
             resume = "codex resume"
         else:
             saved = (await bot.saved_effort(host) if awake else "") or "CLI default"
