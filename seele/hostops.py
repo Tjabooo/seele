@@ -4,12 +4,15 @@ Self-contained on purpose (standard library only, no package imports): for anoth
 SEELE pipes this file's source into `python3 - OP ARGS...` over SSH and reads one JSON line back.
 On this machine the same functions are called directly.
 """
+import base64
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 
@@ -163,8 +166,154 @@ def op_codex_sessions(cwd: str, limit: str = "25") -> list:
     return found
 
 
+# ---------- screenshots ----------
+SHOT_QUALITY = "85"
+
+
+def _hypr_env() -> dict:
+    """This user's environment plus the Wayland/Hyprland variables of the running session
+    (an SSH login has none of them; the session exports them to systemd at start)."""
+    env = dict(os.environ)
+    try:
+        out = subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True,
+                             text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    for line in out.splitlines():
+        key, _, value = line.partition("=")
+        if key in ("WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE", "XDG_RUNTIME_DIR") and value \
+                and not value.startswith("$'"):
+            env.setdefault(key, value)
+    runtime = Path(env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    sig = env.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    if not sig or not (runtime / "hypr" / sig).is_dir():  # stale after a Hyprland restart: newest live one
+        live = sorted((d for d in (runtime / "hypr").glob("*") if (d / ".socket.sock").exists()),
+                      key=lambda d: d.stat().st_mtime)
+        if live:
+            env["HYPRLAND_INSTANCE_SIGNATURE"] = live[-1].name
+    if not env.get("WAYLAND_DISPLAY") or not (runtime / env["WAYLAND_DISPLAY"]).exists():
+        sockets = sorted(p.name for p in runtime.glob("wayland-*") if not p.name.endswith(".lock"))
+        if sockets:
+            env["WAYLAND_DISPLAY"] = sockets[0]
+    return env
+
+
+def _hyprctl(env: dict, what: str):
+    if not shutil.which("hyprctl"):
+        raise RuntimeError("no Hyprland here (hyprctl not found)")
+    done = subprocess.run(["hyprctl", "-j", what], capture_output=True, env=env, timeout=10)
+    try:
+        return json.loads(done.stdout)
+    except ValueError:
+        raise RuntimeError("Hyprland isn't running (or isn't answering): "
+                           + (done.stdout or done.stderr).decode(errors="replace").strip()[:200]) from None
+
+
+def _grim(env: dict, *args: str) -> str:
+    done = subprocess.run(["grim", "-t", "jpeg", "-q", SHOT_QUALITY, *args, "-"], capture_output=True,
+                          env=env, timeout=20)
+    if done.returncode != 0 or not done.stdout:
+        raise RuntimeError("grim: " + done.stderr.decode(errors="replace").strip()[:200])
+    return base64.b64encode(done.stdout).decode()
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-")[:40] or "shot"
+
+
+def op_workspaces() -> list:
+    """[[workspace name, label], ...] of this machine's Hyprland workspaces, in order."""
+    if os.name == "nt":
+        return []
+    env = _hypr_env()
+    shown = {m.get("activeWorkspace", {}).get("name"): m.get("name") for m in _hyprctl(env, "monitors")}
+    titles = {}
+    for c in _hyprctl(env, "clients"):
+        ws = (c.get("workspace") or {}).get("name")
+        if ws and c.get("mapped", True) and not c.get("hidden"):
+            titles.setdefault(ws, []).append(c.get("title") or c.get("class") or "?")
+    found = []
+    for w in _hyprctl(env, "workspaces"):
+        name = w.get("name") or str(w.get("id", ""))
+        if not name:
+            continue
+        where = f"on {shown[name]}" if name in shown else "hidden"
+        top = w.get("lastwindowtitle") or (titles.get(name) or ["empty"])[0]
+        found.append([name, f"{name} · {where} · {top}", w.get("id", -1)])
+    found.sort(key=lambda f: (f[2] < 0, f[2]))  # special workspaces (negative ids) last
+    return [f[:2] for f in found]
+
+
+def op_screenshot(workspace: str = "") -> list:
+    """[[file name, base64 JPEG], ...]: every monitor, or one workspace. A workspace on a monitor is
+    shot as that monitor; a hidden one as each of its windows (Hyprland renders them off screen)."""
+    if os.name == "nt":
+        return _windows_screenshot()
+    if not shutil.which("grim"):
+        raise RuntimeError("grim isn't installed")
+    env = _hypr_env()
+    monitors = [m for m in _hyprctl(env, "monitors") if not m.get("disabled")]
+    if not workspace:
+        return [[f"{_slug(m['name'])}-ws{_slug(m.get('activeWorkspace', {}).get('name', ''))}.jpg",
+                 _grim(env, "-o", m["name"])] for m in monitors]
+    known = {(w.get("name") or str(w.get("id"))): w for w in _hyprctl(env, "workspaces")}
+    ws = known.get(workspace) or next((w for w in known.values() if str(w.get("id")) == workspace), None)
+    if ws is None:
+        raise RuntimeError(f"no workspace {workspace} (it exists only while it has windows)")
+    name = ws.get("name") or str(ws.get("id"))
+    for m in monitors:
+        if m.get("activeWorkspace", {}).get("name") == name or (m.get("specialWorkspace") or {}).get("name") == name:
+            return [[f"ws{_slug(name)}-{_slug(m['name'])}.jpg", _grim(env, "-o", m["name"])]]
+    windows = [c for c in _hyprctl(env, "clients")
+               if (c.get("workspace") or {}).get("name") == name and c.get("mapped", True) and not c.get("hidden")]
+    if not windows:
+        raise RuntimeError(f"workspace {name} has no windows to show")
+    shots = []
+    for c in windows[:10]:
+        ident = str(c.get("stableId") or "")
+        if not ident:
+            raise RuntimeError("this Hyprland is too old to capture windows off screen")
+        shots.append([f"ws{_slug(name)}-{_slug(c.get('class') or 'window')}.jpg", _grim(env, "-T", ident)])
+    return shots
+
+
+def _windows_screenshot() -> list:
+    """The console desktop of a Windows machine. SEELE runs without a desktop (a background task),
+    so ffmpeg's GDI capture runs once as an interactive task in the signed-in user's session."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg isn't installed (winget install ffmpeg)")
+    folder = Path(tempfile.mkdtemp(prefix="seele-shot-"))
+    out, cmd, task = folder / "desktop.jpg", folder / "shot.cmd", f"SEELE-screenshot-{os.getpid()}"
+    cmd.write_text(f'@"{ffmpeg}" -loglevel error -f gdigrab -i desktop -frames:v 1 -q:v 3 -y "{out}" '
+                   f'> "{folder / "log.txt"}" 2>&1\r\n', encoding="ascii")
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        made = subprocess.run(["schtasks", "/create", "/tn", task, "/tr", f'conhost.exe --headless "{cmd}"',
+                               "/sc", "once", "/st", "00:00", "/it", "/f"],
+                              capture_output=True, timeout=20, creationflags=flags)
+        if made.returncode != 0:
+            raise RuntimeError("schtasks: " + (made.stderr or made.stdout).decode(errors="replace").strip()[:200])
+        subprocess.run(["schtasks", "/run", "/tn", task], capture_output=True, timeout=20, creationflags=flags)
+        size, deadline = -1, time.monotonic() + 15
+        while time.monotonic() < deadline:  # done once the file stops growing
+            time.sleep(0.5)
+            now = out.stat().st_size if out.exists() else -1
+            if now > 0 and now == size:
+                return [["desktop.jpg", base64.b64encode(out.read_bytes()).decode()]]
+            size = now
+        log = (folder / "log.txt").read_text(errors="replace").strip() if (folder / "log.txt").exists() else ""
+        raise RuntimeError("no picture from the desktop (nobody signed in, or the screen is locked?) "
+                           + log[:200])
+    finally:
+        subprocess.run(["schtasks", "/delete", "/tn", task, "/f"], capture_output=True, timeout=20,
+                       creationflags=flags)
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 OPS = {"home": op_home, "codex_models": op_codex_models, "codex_sessions": op_codex_sessions, "isdir": op_isdir, "size": op_size, "dirs": op_dirs, "read": op_read,
        "sessions": op_sessions, "pgrep": op_pgrep,
+       "workspaces": op_workspaces, "screenshot": op_screenshot,
        "realpath": op_realpath, "rename": op_rename}
 
 

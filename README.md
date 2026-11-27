@@ -166,6 +166,7 @@ Just write to it. Everything else is slash commands:
 | `/agents [channel]` | Post a live card per background agent in that channel (empty = list them in the status) |
 | `/autoresume on` | After a usage limit, a network outage or API errors, carry on automatically once it's over (default on; `on:False` turns it off) |
 | `/get path` | Upload a file from the machine |
+| `/screenshot [device] [workspace]` | Screenshot a machine: every monitor, or one Hyprland workspace (hidden ones too, window by window); Windows grabs the desktop with ffmpeg. 🔄 Refresh re-takes it |
 | `/listen on` | In a server channel: every message becomes a prompt (needs Message Content Intent) |
 
 Settings stick per DM, channel or thread; a new thread starts with its channel's settings

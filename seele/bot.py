@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import logging
@@ -1677,6 +1678,79 @@ def register_commands(bot: Seele):
         except HostError as e:
             return await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
         await interaction.followup.send(file=discord.File(io.BytesIO(data), posixpath.basename(target)))
+
+    async def take_screenshot(host: Host, workspace: str) -> tuple[str, list[discord.File]]:
+        """(caption, files) for /screenshot and its Refresh button. Raises HostError."""
+        if not await host.reachable():
+            raise HostError(f"**{host.name}** is asleep or off.")
+        shots = await host.op("screenshot", workspace, timeout=60)
+        limit = bot.cfg.max_upload_mb * 1024 * 1024
+        files, skipped = [], 0
+        for name, data in shots[:10]:
+            raw = base64.b64decode(data)
+            if len(raw) > limit:
+                skipped += 1
+                continue
+            files.append(discord.File(io.BytesIO(raw), name))
+        if not files:
+            raise HostError(f"The picture is bigger than {bot.cfg.max_upload_mb} MB.")
+        where = f"workspace **{workspace}**" if workspace else "every monitor"
+        if workspace and os.name == "nt" and host.local:
+            where = "the desktop (Windows has no workspaces)"
+        caption = f"📸 **{host.name}** · {where} · {datetime.now().strftime('%H:%M:%S')}"
+        if skipped:
+            caption += f" · {skipped} left out (over {bot.cfg.max_upload_mb} MB)"
+        return caption, files
+
+    class ShotView(discord.ui.View):
+        def __init__(self, host: Host, workspace: str):
+            super().__init__(timeout=6 * 3600)
+            self.host, self.workspace = host, workspace
+
+        @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary)
+        async def refresh(self, interaction: discord.Interaction, _button: discord.ui.Button):
+            if not bot.is_owner_id(interaction.user.id):
+                return await interaction.response.send_message("This bot only takes orders from its owner.",
+                                                               ephemeral=True)
+            await interaction.response.defer()
+            try:
+                caption, files = await take_screenshot(self.host, self.workspace)
+            except (HostError, OSError, ValueError) as e:
+                return await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
+            await interaction.edit_original_response(content=caption, attachments=files, view=self)
+
+    @command("screenshot", "Screenshot a machine: every monitor, or one workspace (also hidden ones)")
+    @app_commands.describe(device="Machine (empty = this conversation's)",
+                           workspace="Hyprland workspace (empty = every monitor as it looks now)")
+    async def screenshot(interaction: discord.Interaction, device: str = "", workspace: str = ""):
+        if not await guard(interaction):
+            return
+        if device and device not in bot.cfg.hosts:
+            return await interaction.response.send_message(
+                f"Unknown machine. Pick one of: {', '.join(bot.cfg.hosts)}.", ephemeral=True)
+        host = bot.cfg.hosts[device] if device else bot.host_of(await conv_of(interaction))
+        await interaction.response.defer()
+        workspace = workspace.strip()
+        try:
+            caption, files = await take_screenshot(host, workspace)
+        except (HostError, OSError, ValueError) as e:
+            return await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
+        await interaction.followup.send(caption, files=files, view=ShotView(host, workspace))
+
+    @screenshot.autocomplete("device")
+    async def screenshot_device(_interaction, current: str):
+        return [app_commands.Choice(name=n, value=n) for n in bot.cfg.hosts if current.lower() in n.lower()][:25]
+
+    @screenshot.autocomplete("workspace")
+    async def screenshot_workspace(interaction, current: str):
+        device = getattr(interaction.namespace, "device", "") or ""
+        host = bot.cfg.hosts.get(device) or bot.host_of(await conv_of(interaction))
+        try:
+            found = await asyncio.wait_for(host.op("workspaces"), 2.5)
+        except (asyncio.TimeoutError, TimeoutError, HostError, OSError, RuntimeError):
+            found = []
+        return [app_commands.Choice(name=label[:100], value=name[:100]) for name, label in found
+                if current.lower() in label.lower()][:25]
 
     @command("listen", "In a server channel: answer every message here, not only mentions")
     async def listen(interaction: discord.Interaction, on: bool = True):
